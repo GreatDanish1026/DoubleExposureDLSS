@@ -63,11 +63,21 @@ switched; F9 off/on restored the game's 100% scale. No errors.
 
 User saw **noise in the trees and smearing on the character's satchel**. Likely cause: meshes animated
 in their vertex shader (wind on foliage, cloth) write no velocity, so our motion vectors give them
-the camera's motion only; TSR's rejection hides that, DLSS doesn't. 0.1.1 logs the velocity cvars
-once and, while DLSS is on, sets `r.Velocity.EnableVertexDeformation=1` (and the older
-`r.VertexDeformationOutputsVelocity`), restoring the game's values and priority when off
-(overlay switch "Motion for animated foliage and cloth", ini `AnimatedMotion`, on by default).
-Untested.
+the camera's motion only; TSR's rejection hides that, DLSS doesn't.
+
+0.1.1 set `r.Velocity.EnableVertexDeformation=1` while DLSS was on: **the game hung** right after
+(log stops inside the Set). Changing it recreates every primitive's render state, which has to run
+on the game thread; ReShade's present thread deadlocked. It was pointless anyway: the game's
+values (logged) are `r.Velocity.EnableVertexDeformation=2` (auto: on while TSR is the AA method,
+which it stays under DLSS), `r.VertexDeformationOutputsVelocity=-1`, `r.BasePassOutputsVelocity=-1`,
+`r.Velocity.ForceOutput=0`, `r.VelocityOutputPass=1`, `r.SkinCache.Mode=2`, `r.HairStrands.VelocityType=1`.
+0.1.2 only logs them. Lesson: never set cvars with change delegates that touch render state from
+ReShade's thread.
+
+So wind-animated foliage should already write velocity. Remaining suspects for the tree noise and
+satchel smear: (1) UE 5.2's velocity flag for pixel/vertex animation (TSR treats those pixels
+specially; DLSS has a "bias current colour" mask for exactly this), (2) the satchel being
+CPU-simulated cloth without previous positions, (3) the object velocity decode in motion.hlsl.
 
 ## Open
 
