@@ -99,6 +99,14 @@ them likely is (the decode in motion.hlsl came from 5.6). 0.2.1 adds a diagnosis
 motion": linear decode (as before), square-root decode (VELOCITY_ENCODE_GAMMA), or ignore object
 velocity; and preset E (CNN) to check whether the transformer presets ignore the mask.
 
+## Two TSR views (0.2.2)
+
+The game runs TSR twice a frame: the 3840x2160 screen and a 4096x2160 view (2868x1512 render at
+70%; possibly the other timeline). Each output gets its own DLSS feature. A DLSS mode change gives
+TSR new output textures, so 0.2.1 reached its four-feature limit and refused the fifth ("too many
+TSR views"; that view stayed on TSR). 0.2.2 releases features unused for 3 frames before creating
+a new one.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).

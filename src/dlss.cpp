@@ -35,8 +35,13 @@ struct Feature {
     unsigned renderW = 0, renderH = 0, outW = 0, outH = 0;
     int preset = -1;
     NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    uint64_t lastFrame = 0;  // last frame it was evaluated in
 };
+// Double Exposure renders two TSR views a frame (3840x2160 and a 4096x2160 one), and the game
+// hands TSR new output textures when the render size changes, so features of outputs no longer
+// used are released (after kStaleFrames) to make room.
 constexpr size_t kMaxFeatures = 4;
+constexpr uint64_t kStaleFrames = 3;
 std::map<ID3D12Resource*, Feature> g_features;
 
 // A replaced feature may still be used by command lists the GPU hasn't run yet, so it's released
@@ -185,6 +190,16 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
     }
     auto it = g_features.find(in.output);
     if (it == g_features.end()) {
+        for (auto s = g_features.begin(); s != g_features.end();) {  // outputs the game stopped using
+            if (s->second.lastFrame + kStaleFrames < g_frame) {
+                if (s->second.handle) g_retired.push_back({s->second.handle, g_frame});
+                rd::Log("DLSS feature for output %p released (unused for %llu frames)", static_cast<void*>(s->first),
+                        static_cast<unsigned long long>(g_frame - s->second.lastFrame));
+                s = g_features.erase(s);
+            } else {
+                ++s;
+            }
+        }
         if (g_features.size() >= kMaxFeatures) {
             error = "too many TSR views";
             return false;
@@ -192,6 +207,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
         it = g_features.emplace(in.output, Feature()).first;
     }
     Feature& f = it->second;
+    f.lastFrame = g_frame;
     const bool fresh = !f.handle || in.renderWidth != f.renderW || in.renderHeight != f.renderH ||
                        in.outputWidth != f.outW || in.outputHeight != f.outH || in.preset != f.preset;
     if (fresh && !CreateFeature(list, in, f, error)) {
