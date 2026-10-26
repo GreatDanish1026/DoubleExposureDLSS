@@ -10,9 +10,10 @@
 // when it unloads, and Streamline is only started for the swapchain (the real device). Its Present is hooked too: that's where each game frame ends (Reflex
 // latency markers, the frame token, frame generation on or off).
 //
-// Per frame, at the point DLSS upscales (upscaler.cpp), the depth, our motion vectors and the
-// camera constants (from the View uniform buffer) are handed to Streamline, and in HDR the
-// picture before the HUD (see OnCopyResource). Frames without them
+// Per frame, at the point DLSS upscales (upscaler.cpp), the depth (copied), our motion vectors and
+// the camera constants (from the View uniform buffer) are prepared, and in HDR the picture before
+// the HUD (see OnCopyResource); they are handed to Streamline when the command list holding them is
+// submitted (OnExecute), which ties them to the right frame. Frames without them
 // (menus, loading, DLSS off) are presented without generated frames.
 //
 // Loading Streamline only happens if frame generation was on at launch: switching it on later
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -101,18 +103,85 @@ bool g_initTried = false, g_ready = false;
 std::atomic<bool> g_upgraded{false};  // the game's swapchain is Streamline's proxy
 std::string g_status = "off";
 
-// Frames: the token of the frame being recorded; it advances after each game present.
+// Frames: the token of the frame being submitted; it advances after each game present.
 sl::FrameToken* g_token = nullptr;
 uint32_t g_frame = 0;
-// Inputs can arrive for the next frame while this one is still presenting (UE records frame N+1's
-// passes in parallel with frame N's Present): a frame that already has its inputs passes them on
-// to the next frame index. The last two frames given each kind of input are remembered.
+// The last two frames given each kind of input.
 struct Tagged {
     uint32_t last = UINT32_MAX, previous = UINT32_MAX;
     bool Has(uint32_t frame) const { return last == frame || previous == frame; }
     void Set(uint32_t frame) { previous = last, last = frame; }
 };
 Tagged g_inputs, g_hudless;  // depth + motion + constants; the picture before the HUD
+
+// Inputs are prepared while the game records a frame's command list and handed to Streamline when
+// that list is submitted (execute_command_list). Lists are submitted in the order frames are
+// presented, so the frame being submitted is the one the next Present shows: g_frame, exactly.
+// (0.4.x tagged at record time and had to guess: UE records frame N+1, during hitches N+2, while
+// N is still presenting, and the guess left a frame without inputs about three times a minute.)
+// Everything tagged is ours and stays valid until the Present: our motion vectors, our copy of the
+// depth, our copy of the picture before the HUD and the HUD mask.
+struct PendingInputs {
+    sl::Constants constants{};
+    ID3D12Resource* depth = nullptr;  // our copy
+    ID3D12Resource* motion = nullptr;
+    uint32_t rw = 0, rh = 0;
+};
+struct PendingHud {
+    bool mask = false;  // the HUD mask was recorded too
+};
+std::map<uint64_t, PendingInputs> g_pendingInputs;  // by native command list
+std::map<uint64_t, PendingHud> g_pendingHud;
+// Our copies of UE's depth (two, alternating), the depth's size and format.
+ID3D12Resource* g_depthCopy[2] = {};
+int g_depthNext = 0;
+D3D12_RESOURCE_DESC g_depthDesc{};
+constexpr D3D12_RESOURCE_STATES kDepthReadState =
+    D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+void ReleaseDepthCopies() {
+    for (ID3D12Resource*& r : g_depthCopy)
+        if (r) r->Release(), r = nullptr;
+    g_depthDesc = {};
+}
+
+// A texture like <depth> to copy it into (state kDepthReadState), or null.
+ID3D12Resource* DepthCopy(ID3D12Resource* depth) {
+    const D3D12_RESOURCE_DESC d = depth->GetDesc();
+    if (d.Width != g_depthDesc.Width || d.Height != g_depthDesc.Height || d.Format != g_depthDesc.Format ||
+        d.Flags != g_depthDesc.Flags)
+        ReleaseDepthCopies();
+    ID3D12Resource*& slot = g_depthCopy[g_depthNext];
+    if (!slot) {
+        ID3D12Device* dev = nullptr;
+        if (FAILED(depth->GetDevice(IID_PPV_ARGS(&dev)))) return nullptr;
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        const HRESULT hr = dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, kDepthReadState, nullptr,
+                                                        IID_PPV_ARGS(&slot));
+        dev->Release();
+        if (FAILED(hr)) {
+            slot = nullptr;
+            Log("frame generation: couldn't create a %llux%u depth copy (0x%08x)", d.Width, d.Height, static_cast<unsigned>(hr));
+            return nullptr;
+        }
+        g_depthDesc = d;
+        Log("frame generation: created %llux%u depth copy (format %u)", d.Width, d.Height, static_cast<unsigned>(d.Format));
+    }
+    ID3D12Resource* r = slot;
+    g_depthNext ^= 1;
+    return r;
+}
+
+D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    return b;
+}
 
 // Back buffer size and format (ReShade's swapchain), and our copy of the picture before the HUD.
 uint32_t g_bbWidth = 0, g_bbHeight = 0;
@@ -612,6 +681,8 @@ void OnDestroyDevice(device* dev) {
     if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
     if (g_uiReadback.handle && g_hudlessDevice == dev) dev->destroy_resource(g_uiReadback), g_uiReadback = {0};
     if (g_hudlessDevice == dev) DestroyMask(dev);
+    ReleaseDepthCopies();
+    g_pendingInputs.clear(), g_pendingHud.clear();
     if (!g_ready) return;
     g_ready = false;
     g_sl.shutdown();
@@ -621,17 +692,7 @@ void OnDestroyDevice(device* dev) {
 
 // The frame index inputs are meant for: this frame, or the next one if this one has them already.
 // UINT32_MAX if both have them.
-uint32_t TargetFrame(const Tagged& t) {
-    if (!t.Has(g_frame)) return g_frame;
-    if (!t.Has(g_frame + 1)) return g_frame + 1;
-    return UINT32_MAX;
-}
 
-sl::FrameToken* TokenFor(uint32_t frame) {
-    if (frame == g_frame) return g_token;
-    sl::FrameToken* t = nullptr;
-    return g_sl.getNewFrameToken(t, &frame) == sl::Result::eOk ? t : nullptr;
-}
 
 // ---------------------------------------------------------------- the HUD layer
 //
@@ -664,6 +725,9 @@ void OnDestroyResource(device* dev, resource r) {
 void OnDestroyList(command_list* cl) { cl->destroy_private_data<FgList>(); }
 void OnResetList(command_list* cl) {
     if (FgList* l = cl->get_private_data<FgList>()) l->uiLayer = {0};
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_pendingInputs.erase(cl->get_native());
+    g_pendingHud.erase(cl->get_native());
 }
 
 bool IsUiFormat(format f) {
@@ -811,8 +875,6 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     if (dd.texture.width != g_bbWidth || dd.texture.height != g_bbHeight || dd.texture.format != g_bbFormat) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_token) return false;
-    const uint32_t frame = TargetFrame(g_hudless);
-    if (frame == UINT32_MAX) return false;
     if (!g_hudlessTex.handle) {
         const resource_desc d(g_bbWidth, g_bbHeight, 1, 1, g_bbFormat, 1, memory_heap::default_,
                               resource_usage::shader_resource | resource_usage::copy_dest);
@@ -825,37 +887,17 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
         Log("frame generation: pre-HUD picture found (%ux%u, format %u)", g_bbWidth, g_bbHeight,
             static_cast<uint32_t>(g_bbFormat));
     }
-    sl::FrameToken* token = TokenFor(frame);
-    if (!token) return false;
     // The game has the back buffer in the copy-source state for its own copy, recorded after ours.
     cl->barrier(g_hudlessTex, resource_usage::shader_resource, resource_usage::copy_dest);
     cl->copy_resource(src, g_hudlessTex);
     cl->barrier(g_hudlessTex, resource_usage::copy_dest, resource_usage::shader_resource);
-    sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
-                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
-    const sl::ResourceTag tag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent);
-    const sl::Result r = g_sl.setTagForFrame(*token, sl::ViewportHandle(0), &tag, 1,
-                                             reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
-    if (r != sl::Result::eOk) {
-        static int logged = 0;
-        if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed: %d", static_cast<int>(r));
-        return false;
-    }
-    g_hudless.Set(frame);
-    ++g_hudlessCount;
+    PendingHud& pending = g_pendingHud[cl->get_native()];  // tagged when the list is submitted
+    pending.mask = false;
     FgList* l = cl->get_private_data<FgList>();
     const resource ui = l ? l->uiLayer : resource{0};
     if (ui.handle) {
         if (g_uiCheck == UiCheck::pending && g_presents > 120) ReadUiRow(cl, ui);  // past the first frames
-        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) {
-            sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
-                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            const sl::ResourceTag maskTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent);
-            if (g_sl.setTagForFrame(*token, sl::ViewportHandle(0), &maskTag, 1,
-                                    reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native())) == sl::Result::eOk)
-                ++g_uiCount;
-        }
+        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) pending.mask = true;
     }
     return false;  // the game's copy goes ahead
 }
@@ -902,10 +944,6 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
                  unsigned rh, float jitterX, float jitterY, bool reset) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_ready || !g_set.enabled || !g_token || !g_camera.valid) return;
-    const uint32_t frame = TargetFrame(g_inputs);
-    if (frame == UINT32_MAX) return;  // another view this frame
-    sl::FrameToken* token = TokenFor(frame);
-    if (!token) return;
     const Camera& cam = g_camera;
     sl::Constants c{};
     float inv[16], prevToCur[16], m[16];
@@ -945,33 +983,93 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
     c.motionVectorsDilated = sl::Boolean::eFalse;
     c.motionVectorsJittered = sl::Boolean::eFalse;
     c.minRelativeLinearDepthObjectSeparation = g_set.separation;
-    sl::Result r = g_sl.setConstants(c, *token, sl::ViewportHandle(0));
-    if (r != sl::Result::eOk) {
-        static int logged = 0;
-        if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
-        return;
-    }
-    // Depth: UE's scene depth (reused later in the frame: Streamline copies it now).
-    // Motion: our own texture, unchanged until the next frame.
-    sl::Resource depthRes(sl::ResourceType::eTex2d, depth, nullptr, nullptr,
-                          D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    sl::Resource motionRes(sl::ResourceType::eTex2d, motion, nullptr, nullptr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    const sl::Extent extent{0, 0, rw, rh};
-    // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
-    const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
-    const sl::ResourceTag tags[3] = {sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent),
-                                     sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                                     sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
-    r = g_sl.setTagForFrame(*token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, list);
-    if (r != sl::Result::eOk) {
-        static int logged = 0;
-        if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
-        return;
-    }
-    g_inputs.Set(frame);
-    if (++g_tagged == 1) Log("frame generation: first frame tagged (%ux%u)", rw, rh);
+    // UE reuses its depth buffer later in the frame: copy it (our copy stays valid until the Present).
+    ID3D12Resource* copy = DepthCopy(depth);
+    if (!copy) return;
+    const D3D12_RESOURCE_BARRIER before[2] = {Transition(depth, kDepthReadState, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                              Transition(copy, kDepthReadState, D3D12_RESOURCE_STATE_COPY_DEST)};
+    const D3D12_RESOURCE_BARRIER after[2] = {Transition(depth, D3D12_RESOURCE_STATE_COPY_SOURCE, kDepthReadState),
+                                             Transition(copy, D3D12_RESOURCE_STATE_COPY_DEST, kDepthReadState)};
+    list->ResourceBarrier(2, before);
+    list->CopyResource(copy, depth);
+    list->ResourceBarrier(2, after);
+    PendingInputs& pending = g_pendingInputs[reinterpret_cast<uint64_t>(list)];  // tagged when the list is submitted
+    pending.constants = c;
+    pending.depth = copy, pending.motion = motion, pending.rw = rw, pending.rh = rh;
 }
+
+namespace {
+
+// A command list was submitted: what it prepared belongs to the frame the next Present shows.
+void OnExecute(command_queue*, command_list* cl) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_pendingInputs.empty() && g_pendingHud.empty()) return;
+    const uint64_t key = cl->get_native();
+    auto in = g_pendingInputs.find(key);
+    auto hud = g_pendingHud.find(key);
+    if (in == g_pendingInputs.end() && hud == g_pendingHud.end()) return;
+    if (!g_ready || !g_token) {
+        if (in != g_pendingInputs.end()) g_pendingInputs.erase(in);
+        if (hud != g_pendingHud.end()) g_pendingHud.erase(hud);
+        return;
+    }
+    if (in != g_pendingInputs.end()) {
+        const PendingInputs p = in->second;
+        g_pendingInputs.erase(in);
+        sl::Result r = g_sl.setConstants(p.constants, *g_token, sl::ViewportHandle(0));
+        if (r != sl::Result::eOk) {
+            static int logged = 0;
+            if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
+        } else {
+            sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
+            sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr,
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const sl::Extent extent{0, 0, p.rw, p.rh};
+            // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
+            const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
+            const sl::ResourceTag tags[3] = {
+                sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+                sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+                sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
+            r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, nullptr);
+            if (r != sl::Result::eOk) {
+                static int logged = 0;
+                if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
+            } else {
+                if (g_inputs.Has(g_frame)) {
+                    static int logged = 0;
+                    if (logged++ < 10) Log("frame generation: two sets of inputs submitted for frame %u", g_frame);
+                }
+                g_inputs.Set(g_frame);
+                if (++g_tagged == 1) Log("frame generation: first frame tagged at submission (%ux%u)", p.rw, p.rh);
+            }
+        }
+    }
+    if (hud != g_pendingHud.end()) {
+        const PendingHud h = hud->second;
+        g_pendingHud.erase(hud);
+        const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
+        sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
+                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const sl::ResourceTag tags[2] = {
+            sl::ResourceTag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+            sl::ResourceTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
+        const uint32_t n = h.mask && g_mask.tex.handle ? 2 : 1;
+        if (g_hudlessTex.handle &&
+            g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, n, nullptr) == sl::Result::eOk) {
+            g_hudless.Set(g_frame);
+            ++g_hudlessCount;
+            if (n == 2) ++g_uiCount;
+        } else {
+            static int logged = 0;
+            if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed");
+        }
+    }
+}
+
+}  // namespace
 
 void RegisterFrameGen() {
     if (!reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGenMode", g_set.mode)) {
@@ -988,6 +1086,7 @@ void RegisterFrameGen() {
     reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
     reshade::register_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
     reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
+    reshade::register_event<reshade::addon_event::execute_command_list>(&OnExecute);
     reshade::register_event<reshade::addon_event::init_command_list>(&OnInitList);
     reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::register_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);
@@ -1001,6 +1100,7 @@ void UnregisterFrameGen() {
     reshade::unregister_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
     reshade::unregister_event<reshade::addon_event::copy_resource>(&OnCopyResource);
+    reshade::unregister_event<reshade::addon_event::execute_command_list>(&OnExecute);
     reshade::unregister_event<reshade::addon_event::init_command_list>(&OnInitList);
     reshade::unregister_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::unregister_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);

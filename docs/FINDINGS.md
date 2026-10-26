@@ -179,6 +179,18 @@ size, then 4096x2160), none released or recreated during play: keying by output 
 Dynamic moved between 2, 3 and 6 frames per rendered frame. Still three single frames without tags
 (Streamline reuses the last; frame generation pauses briefly) in about 55 s; to look into.
 
+## Tags at submission (0.6.0, untested)
+
+The few frames a minute without tags came from tagging at record time: the add-on had to guess the
+frame (the current one, or the next if the current one already had inputs), and UE records frame
+N+1, during hitches N+2, while N is still presenting. 0.6.0 prepares the inputs at record time and
+hands them to Streamline in `execute_command_list` (ReShade calls it for each list the game
+submits): lists are submitted in the order frames are presented, so the frame is the current token,
+exactly. All tagged resources are ours and eValidUntilPresent, so no command list is needed at
+submission: UE's depth is copied into one of two alternating textures of its own format
+(r32g8x24_typeless, D3D12 CopyResource on the game's list), plus our motion vectors, our pre-HUD
+copy and the HUD mask. The log warns if two sets of inputs are submitted for one frame.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
