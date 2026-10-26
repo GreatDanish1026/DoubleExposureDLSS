@@ -98,7 +98,10 @@ struct SlApi {
     PFun_slPCLSetMarker* pclSetMarker = nullptr;
 } g_sl;
 
-std::mutex g_mutex;
+// Recursive: Streamline calls made under it (its shutdown at exit, which submits a last command
+// list) come back into this add-on on the same thread through ReShade's events (OnExecute). A plain
+// std::mutex throws there ("resource deadlock would occur") and the game aborted at exit (0.6.0).
+std::recursive_mutex g_mutex;
 bool g_initTried = false, g_ready = false;
 std::atomic<bool> g_upgraded{false};  // the game's swapchain is Streamline's proxy
 std::string g_status = "off";
@@ -323,7 +326,7 @@ void SetFrameGeneration(bool on) {
 void CheckUiRow();
 
 void BeforePresent() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready) return;
     ++g_presents;
     Marker(sl::PCLMarker::eRenderSubmitEnd);
@@ -360,7 +363,7 @@ void BeforePresent() {
 void AfterPresent() {
     sl::FrameToken* token = nullptr;
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_ready) return;
         Marker(sl::PCLMarker::ePresentEnd);
         const uint32_t next = g_frame + 1;
@@ -455,7 +458,7 @@ bool InitStreamline(ID3D12Device* device, std::string& error);
 
 // Starts Streamline (once) for the device of the queue the game creates its swapchain on.
 bool EnsureStreamline(IUnknown* queueOrDevice) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_initTried) return g_ready;
     ID3D12CommandQueue* queue = nullptr;
     if (!queueOrDevice || FAILED(queueOrDevice->QueryInterface(IID_PPV_ARGS(&queue)))) return false;  // not D3D12
@@ -662,7 +665,7 @@ bool g_factoryHooked = false;
 
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d12) return;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_factoryHooked || !g_set.enabled) return;
     std::string err;
     if (!HookFactory(err)) {
@@ -677,7 +680,7 @@ void OnInitDevice(device* dev) {
 
 void OnDestroyDevice(device* dev) {
     if (dev->get_api() != device_api::d3d12) return;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
     if (g_uiReadback.handle && g_hudlessDevice == dev) dev->destroy_resource(g_uiReadback), g_uiReadback = {0};
     if (g_hudlessDevice == dev) DestroyMask(dev);
@@ -714,7 +717,7 @@ std::atomic<uint64_t> g_uiCount{0};
 void OnInitList(command_list* cl) { cl->create_private_data<FgList>(); }
 
 void OnDestroyResource(device* dev, resource r) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     for (size_t i = 0; i < g_mask.srvs.size(); ++i)
         if (g_mask.srvs[i].first == r.handle) {
             dev->destroy_resource_view(g_mask.srvs[i].second);
@@ -725,7 +728,7 @@ void OnDestroyResource(device* dev, resource r) {
 void OnDestroyList(command_list* cl) { cl->destroy_private_data<FgList>(); }
 void OnResetList(command_list* cl) {
     if (FgList* l = cl->get_private_data<FgList>()) l->uiLayer = {0};
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_pendingInputs.erase(cl->get_native());
     g_pendingHud.erase(cl->get_native());
 }
@@ -873,7 +876,7 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
         return false;
     const resource_desc dd = dev->get_resource_desc(dst);
     if (dd.texture.width != g_bbWidth || dd.texture.height != g_bbHeight || dd.texture.format != g_bbFormat) return false;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_token) return false;
     if (!g_hudlessTex.handle) {
         const resource_desc d(g_bbWidth, g_bbHeight, 1, 1, g_bbFormat, 1, memory_heap::default_,
@@ -906,7 +909,7 @@ void OnInitSwapchain(swapchain* sc, bool) {
     const resource bb = sc->get_back_buffer(0);
     if (!bb.handle) return;
     const resource_desc d = sc->get_device()->get_resource_desc(bb);
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_hudlessTex.handle && (d.texture.width != g_bbWidth || d.texture.height != g_bbHeight || d.texture.format != g_bbFormat)) {
         g_hudlessDevice->destroy_resource(g_hudlessTex);  // resize: the game waits for the GPU first
         g_hudlessTex = {0};
@@ -916,19 +919,19 @@ void OnInitSwapchain(swapchain* sc, bool) {
 }
 
 void OnDestroySwapchain(swapchain*, bool) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_bbWidth = 0;  // no pre-HUD copies until the swapchain is back
 }
 
 }  // namespace
 
 bool FrameGenIsScreen(unsigned width, unsigned height) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     return g_bbWidth && width == g_bbWidth && height == g_bbHeight;
 }
 
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready || clipToPrevClipOffset < 0) return;
     if (!g_cameraChecked) g_cameraChecked = true, g_cameraOk = CheckCamera(view);
     if (!g_cameraOk) return;
@@ -942,7 +945,7 @@ void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
 
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned rw,
                  unsigned rh, float jitterX, float jitterY, bool reset) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready || !g_set.enabled || !g_token || !g_camera.valid) return;
     const Camera& cam = g_camera;
     sl::Constants c{};
@@ -1002,7 +1005,7 @@ namespace {
 
 // A command list was submitted: what it prepared belongs to the frame the next Present shows.
 void OnExecute(command_queue*, command_list* cl) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_pendingInputs.empty() && g_pendingHud.empty()) return;
     const uint64_t key = cl->get_native();
     auto in = g_pendingInputs.find(key);
@@ -1127,7 +1130,7 @@ void DrawFrameGenSettings() {
          "in menus). Switching on from Off takes a game restart; the multipliers switch right away.");
 
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (g_set.enabled && !g_ready && !g_initTried && !g_factoryHooked)
             ImGui::TextColored(kWarn, "Restart the game to start frame generation.");
         if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
@@ -1147,7 +1150,7 @@ void DrawFrameGenSettings() {
 }
 
 std::string FrameGenHeadline(bool* warn) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     *warn = false;
     if (!g_set.enabled) return "Frame generation off";
     if (!g_ready) {
@@ -1166,7 +1169,7 @@ std::string FrameGenHeadline(bool* warn) {
 
 void DrawFrameGenStatus() {
     ImGui::SeparatorText("Frame generation");
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready) {
         ImGui::TextDisabled("Streamline: %s", g_status.c_str());
         return;

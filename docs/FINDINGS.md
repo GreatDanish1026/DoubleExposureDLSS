@@ -191,6 +191,20 @@ submission: UE's depth is copied into one of two alternating textures of its own
 (r32g8x24_typeless, D3D12 CopyResource on the game's list), plus our motion vectors, our pre-HUD
 copy and the HUD mask. The log warns if two sets of inputs are submitted for one frame.
 
+### Result and exit crash (0.6.1)
+
+0.6.0 log (about a minute of play): untagged frames only at the two moments frame generation
+switched on (start, and resuming after loading at 22 s: once two input sets landed in one frame,
+"Setting different 'common' constants multiple times within the same frame"; the game submits from
+more than one thread); then 35 s of play to exit with **no errors** (0.5.0: about three a minute).
+
+**The game aborted at exit** (UE crash report "Abort signal received"): our OnDestroyDevice held
+g_mutex while calling slShutdown; DLSS-G submitted a last command list, ReShade's
+execute_command_list event called OnExecute on the same thread, and std::mutex threw "resource
+deadlock would occur". Stack: game -> ReShade dxgi -> our add-on -> sl.interposer -> DLSS-G plugin
+-> d3d12 -> ReShade dxgi -> our add-on -> abort. 0.6.1 makes framegen.cpp's mutex recursive
+(OnExecute then sees g_ready false and returns).
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
