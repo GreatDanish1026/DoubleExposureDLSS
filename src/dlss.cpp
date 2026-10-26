@@ -37,12 +37,14 @@ struct Feature {
     NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
     uint64_t lastFrame = 0;  // last frame it was evaluated in
 };
-// Double Exposure renders two TSR views a frame (3840x2160 and a 4096x2160 one), and the game
-// hands TSR new output textures when the render size changes, so features of outputs no longer
-// used are released (after kStaleFrames) to make room.
+// One feature per output size. Double Exposure starts at 3840x2160 and switches to its 4096x2160
+// setting a second later, so features of sizes no longer used are released (after kStaleFrames).
 constexpr size_t kMaxFeatures = 4;
 constexpr uint64_t kStaleFrames = 3;
-std::map<ID3D12Resource*, Feature> g_features;
+// Keyed by output size, not by the output texture: TSR's output comes from UE's render target pool
+// and the game swaps it now and then; a feature per texture restarted DLSS (history) each time.
+uint64_t SizeKey(unsigned w, unsigned h) { return (static_cast<uint64_t>(w) << 32) | h; }
+std::map<uint64_t, Feature> g_features;
 
 // A replaced feature may still be used by command lists the GPU hasn't run yet, so it's released
 // only some frames later.
@@ -122,8 +124,8 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, Feature& f
     }
     f.renderW = in.renderWidth, f.renderH = in.renderHeight, f.outW = in.outputWidth, f.outH = in.outputHeight;
     f.preset = in.preset, f.quality = q;
-    rd::Log("DLSS feature created for output %p: %ux%u -> %ux%u, %s mode, preset %d (%zu views)",
-            static_cast<void*>(in.output), in.renderWidth, in.renderHeight, in.outputWidth, in.outputHeight, QualityName(q),
+    rd::Log("DLSS feature created: %ux%u -> %ux%u, %s mode, preset %d (%zu output sizes)",
+            in.renderWidth, in.renderHeight, in.outputWidth, in.outputHeight, QualityName(q),
             in.preset, g_features.size());
     return true;
 }
@@ -188,12 +190,13 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
         error = g_initError.empty() ? "DLSS not started" : g_initError;
         return false;
     }
-    auto it = g_features.find(in.output);
+    const uint64_t key = SizeKey(in.outputWidth, in.outputHeight);
+    auto it = g_features.find(key);
     if (it == g_features.end()) {
         for (auto s = g_features.begin(); s != g_features.end();) {  // outputs the game stopped using
             if (s->second.lastFrame + kStaleFrames < g_frame) {
                 if (s->second.handle) g_retired.push_back({s->second.handle, g_frame});
-                rd::Log("DLSS feature for output %p released (unused for %llu frames)", static_cast<void*>(s->first),
+                rd::Log("DLSS feature for %ux%u output released (unused for %llu frames)", s->second.outW, s->second.outH,
                         static_cast<unsigned long long>(g_frame - s->second.lastFrame));
                 s = g_features.erase(s);
             } else {
@@ -204,7 +207,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
             error = "too many TSR views";
             return false;
         }
-        it = g_features.emplace(in.output, Feature()).first;
+        it = g_features.emplace(key, Feature()).first;
     }
     Feature& f = it->second;
     f.lastFrame = g_frame;

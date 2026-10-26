@@ -168,7 +168,8 @@ tried). Not on the main menu: no TSR view to tag there, so frames are presented 
 ones (by design, as in Reunion; generated frames would warp flat UI). Leftovers: TSR's output
 texture comes from UE's render target pool and is sometimes swapped (features released "unused for
 2021 frames"), which recreates the DLSS feature (history reset) and leaves a frame untagged for
-Streamline; keying features by output size would avoid it.
+Streamline. **0.4.2 keys DLSS features and the reset/size bookkeeping by output size**, so a
+swapped texture of the same size keeps DLSS's history (untested).
 
 ## Open
 

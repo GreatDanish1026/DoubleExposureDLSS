@@ -351,7 +351,8 @@ void Skip(const char* reason, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
     if (n++ < 3) Log("TSR kept for this view: %s (%u %u %u)", reason, a, b, c);
 }
 std::string g_error;
-std::map<uint64_t, bool> g_resetByOutput;  // per view
+// Per output size (not texture: the game swaps TSR's output texture from UE's pool).
+std::map<uint64_t, bool> g_resetByOutput;
 // Render size per view: a new size (DLSS mode or menu change) starts DLSS and frame generation
 // over, instead of blending in the previous size's frame (a one-frame streak at the bottom edge).
 std::map<uint64_t, uint64_t> g_sizeByOutput;
@@ -712,11 +713,12 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     }
     g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1];
     if (g_resetAll) g_resetByOutput.clear(), g_resetAll = false;
-    auto rs = g_resetByOutput.find(output.handle);
+    const uint64_t outKey = (static_cast<uint64_t>(out.texture.width) << 32) | out.texture.height;
+    auto rs = g_resetByOutput.find(outKey);
     const uint64_t size = (static_cast<uint64_t>(rw) << 32) | rh;
-    auto ss = g_sizeByOutput.find(output.handle);
+    auto ss = g_sizeByOutput.find(outKey);
     const bool resized = ss != g_sizeByOutput.end() && ss->second != size;
-    g_sizeByOutput[output.handle] = size;
+    g_sizeByOutput[outKey] = size;
     if (g_sizeByOutput.size() > 64) g_sizeByOutput.clear();
     const bool reset = rs == g_resetByOutput.end() || rs->second || resized;
 
@@ -751,7 +753,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
             FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh,
                         in.jitterX, in.jitterY, reset);
         }
-        g_resetByOutput[output.handle] = false;
+        g_resetByOutput[outKey] = false;
         g_error.clear();
         if (++g_evaluated == 1) Log("DLSS: first frame evaluated");
     } else {
