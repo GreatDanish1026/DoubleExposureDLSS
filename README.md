@@ -4,8 +4,8 @@ A ReShade add-on that will put NVIDIA DLSS (and DLSS Frame Generation) in place 
 **Life is Strange: Double Exposure** (Unreal Engine 5.2, DirectX 12). Built from ReunionDLSS.
 Separate from DoubleExposureTweaks.
 
-**0.0.1 is a mapping build:** DLSS and frame generation are locked off until TSR's passes in this
-game are known. It captures frames for that (overlay, Status tab, **Capture frame (F10)**).
+**0.1.0: TSR is mapped; DLSS is untested in game.** Frame generation is untested too. (0.0.1 was a mapping build:
+frame capture still on the Status tab, F10.)
 
 ## Install
 

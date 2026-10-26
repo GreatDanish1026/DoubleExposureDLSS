@@ -25,15 +25,18 @@ const std::wstring& ExeDir();
 // FNV-1a of a compute pipeline's shader bytecode (0 if unknown): stable across runs.
 uint32_t PipeId(reshade::api::pipeline pipe);
 
-// TSR's compute shaders in this game build (docs/FINDINGS.md). Not mapped yet: these are
-// placeholders that match nothing, and DLSS stays off until kTsrMapped is true.
-constexpr bool kTsrMapped = false;
-constexpr uint32_t kTsrDilateVelocity = 0xfffffff1;
-constexpr uint32_t kTsrDecimateHistory = 0xfffffff2;
-constexpr uint32_t kTsrRejectShading = 0xfffffff3;
-constexpr uint32_t kTsrSpatialAntiAliasing = 0xfffffff4;
-constexpr uint32_t kTsrUpdateHistory = 0xfffffff5;
-constexpr uint32_t kTsrResolveHistory = 0xfffffff6;
+// TSR's compute shaders in this game build 16505703 (UE 5.2.1; capture 2026-10-26,
+// docs/FINDINGS.md), in the order they run, all in one command list on the graphics queue.
+constexpr bool kTsrMapped = true;
+constexpr uint32_t kTsrClearPrevTextures = 0x42e09aac;
+constexpr uint32_t kTsrForwardScatterDepth = 0x02016352;
+constexpr uint32_t kTsrDilateVelocity = 0xcf6ec20a;     // t0 depth, t1 velocity -> u0 dilated velocity
+constexpr uint32_t kTsrDecimateHistory = 0x67aa2e5d;    // t0 = DilateVelocity's u0 (links the chain)
+constexpr uint32_t kTsrRejectShading = 0xbd30efd9;
+constexpr uint32_t kTsrSpatialAntiAliasing = 0xd9c8c910;
+constexpr uint32_t kTsrFilterAntiAliasing = 0xd77fb051;
+constexpr uint32_t kTsrUpdateHistory = 0x23742aef;      // t0 scene colour -> u0 7680x4320 history
+constexpr uint32_t kTsrResolveHistory = 0xd14da7eb;     // t0 history -> u0 output, u1 half-res copy
 
 // upscaler.cpp
 void RegisterUpscaler();

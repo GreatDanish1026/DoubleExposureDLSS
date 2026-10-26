@@ -215,8 +215,9 @@ struct ListLog {
 };
 
 // TSR's compute shaders in this game build (stable across runs; docs/FINDINGS.md), in order.
-const uint32_t kTsrShaders[] = {rd::kTsrDilateVelocity, rd::kTsrDecimateHistory, rd::kTsrRejectShading,
-                                rd::kTsrSpatialAntiAliasing, rd::kTsrUpdateHistory, rd::kTsrResolveHistory};
+const uint32_t kTsrShaders[] = {rd::kTsrClearPrevTextures,  rd::kTsrForwardScatterDepth, rd::kTsrDilateVelocity,
+                                rd::kTsrDecimateHistory,    rd::kTsrRejectShading,       rd::kTsrSpatialAntiAliasing,
+                                rd::kTsrFilterAntiAliasing, rd::kTsrUpdateHistory,       rd::kTsrResolveHistory};
 
 bool IsTsr(uint32_t id) {
     for (uint32_t t : kTsrShaders)

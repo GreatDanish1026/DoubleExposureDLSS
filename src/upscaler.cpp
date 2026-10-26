@@ -6,7 +6,8 @@
 //     computed there into our own texture. The engine's velocity only covers moving objects; the
 //     camera's motion comes from the depth and View.ClipToPrevClip (found in the View uniform
 //     buffer from TemporalAAJitter). DilateVelocity is recorded in a different command list, so
-//     the result is found later through its output u0, which RejectShading reads (t8).
+//     the result is found later through its output u0, which DecimateHistory reads (t0; in UE 5.6
+//     it was RejectShading's t8).
 //   UpdateHistory (t0): the scene color with translucency -> copied into our own texture
 //   ResolveHistory (u0): the 3840x2160 output, and from its parameters the render size, jitter and
 //     motion vector scale (offsets 0, 256 and 272, docs/FINDINGS.md). The game's pass runs first
@@ -93,7 +94,7 @@ struct StageState {
     }
 };
 
-// One TSR run's inputs, gathered in the command list that records RejectShading, UpdateHistory
+// One TSR run's inputs, gathered in the command list that records DecimateHistory, UpdateHistory
 // and ResolveHistory (in that order).
 struct Chain {
     resource depth = {0}, motion = {0}, color = {0};
@@ -317,7 +318,7 @@ resource CopyInput(command_list* cl, resource src, resource_usage srcState, form
     return tex;
 }
 
-// DilateVelocity writes a texture (u0) that RejectShading reads (t8), and is recorded in another
+// DilateVelocity writes a texture (u0) that DecimateHistory reads (t0), and may be recorded in another
 // command list, so its depth and our motion vectors are found through that texture.
 struct Link {
     resource depth = {0}, motion = {0};
@@ -386,7 +387,7 @@ bool LooksLikeJitterRow(const float* r, const float jitter[2], const float size[
     return std::fabs(std::fabs(r[0] / r[1]) / want - 1) < 0.05f;
 }
 
-constexpr int kKnownClipToPrevClip = 2176;  // this game build (docs/FINDINGS.md)
+constexpr int kKnownClipToPrevClip = -1;  // not known for this game yet: searched (and logged)
 
 void FindClipToPrevClip(const float* v, const float jitter[2], const float size[2]) {
     const auto valid = [&](int byteOffset) {
@@ -394,7 +395,7 @@ void FindClipToPrevClip(const float* v, const float jitter[2], const float size[
         return LooksLikeClipToPrevClip(m) && LooksLikeJitterRow(m + 32, jitter, size);
     };
     int found = -1;
-    if (valid(kKnownClipToPrevClip)) {
+    if (kKnownClipToPrevClip >= 0 && valid(kKnownClipToPrevClip)) {
         found = kKnownClipToPrevClip;
     } else {
         for (uint32_t i = 32; i + 4 <= kViewScanFloats; i += 4)
@@ -560,9 +561,11 @@ void OnDilateVelocity(command_list* cl, ListState& s) {
     link.motion = ComputeMotion(cl, s, depth, velocity);
 }
 
-void OnRejectShading(command_list* cl, ListState& s) {
+// UE 5.2: DecimateHistory is the first pass after DilateVelocity that reads its output (t0);
+// RejectShading doesn't (5.6's read it at t8).
+void OnChainStart(command_list* cl, ListState& s) {
     s.chain = Chain();
-    const resource dilated = Bound(cl, s.compute, 0, 8);
+    const resource dilated = Bound(cl, s.compute, 0, 0);
     auto it = g_links.find(dilated.handle);
     if (it == g_links.end()) return;
     s.chain.depth = it->second.depth;
@@ -667,8 +670,8 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
         case kTsrDilateVelocity:
             OnDilateVelocity(cl, *s);
             return false;
-        case kTsrRejectShading:
-            OnRejectShading(cl, *s);
+        case kTsrDecimateHistory:
+            OnChainStart(cl, *s);
             return false;
         case kTsrUpdateHistory:
             OnUpdateHistory(cl, *s);

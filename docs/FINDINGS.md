@@ -25,7 +25,43 @@ passes. Named TSR textures include `TSR.Velocity.Dilated`, `TSR.ClosestDepthText
 - cvars: UE 5.2 layout (DoubleExposureTweaks' `cvars.hpp`); the DLSS mode's `r.ScreenPercentage`
   write is copied to the render thread by the add-on.
 
-## To map (needs a capture)
+## TSR map (capture 2026-10-26, gameplay, 3840x2160 at 100% resolution scale)
+
+`DoubleExposureDLSS-frame-1.txt`: two frames, 518 dispatches. TSR is nine compute passes in one
+command list on the graphics queue, found by TSR's common parameter block (root CBV param 2, history
+size 7680x4320 at byte 112). Render textures are allocated at the full 3840x2160 whatever the
+resolution scale; the view size comes from the parameters.
+
+| shader id | groups (at 100%) | pass | key bindings |
+|---|---|---|---|
+| `42e09aac` | 240x135 | ClearPrevTextures | u0-u2 r32uint |
+| `02016352` | 480x270 | ForwardScatterDepth | t0 r32uint -> u0 r32uint |
+| `cf6ec20a` | 480x270 | **DilateVelocity** | t0 depth `r32g8x24_typeless`, t1 velocity `rgba16unorm` -> u0 dilated velocity `rg16unorm`, u1 closest depth r16f |
+| `67aa2e5d` | 480x270 | **DecimateHistory** | t0 = DilateVelocity's u0, t1 closest depth |
+| `bd30efd9` | 320x180 | RejectShading | t0 scene colour rgba16f, t2 rgba16f |
+| `d9c8c910` | 480x270 | SpatialAntiAliasing | |
+| `d77fb051` | 480x270 | FilterAntiAliasing | |
+| `23742aef` | 960x540 | **UpdateHistory** | t0 scene colour rgba16f, t1 rgba16f -> u0 history 7680x4320 rgba16f |
+| `d14da7eb` | 480x270 | **ResolveHistory** | t0 history -> u0 output 3840x2160 r11g11b10f, u1 1920x1080 half-res copy |
+
+ComputeMoireLuma didn't run (no pass between DilateVelocity and DecimateHistory).
+
+TSR's common parameters (param 2) have the same layout as UE 5.6's: 0 extent, 32 ViewportMin/Max,
+48 ViewportSize, 112 history size, 256 jitter in render pixels (`-0.375, -0.0556` in the capture),
+272 ScreenVelocityToInputPixelVelocity (1920, -1080 at 100%). The View uniform buffer is root CBV
+param 3 (as in 5.6); ClipToPrevClip's offset is searched at run time (Reunion's 2176 is skipped).
+
+Differences from 5.6 handled in 0.1.0: the chain is linked at DecimateHistory's t0 (5.6:
+RejectShading's t8); the scene colour feed is UpdateHistory's t0 as in 5.6 (5.2 has no separate
+RejectShading feed). The output is r11g11b10f even with HDR output (DLSS accepts it).
+
+## Open
+
+- Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
+- View.ClipToPrevClip offset (logged on the first DLSS frame).
+- Frame generation: the HUD-less copy and HUD alpha were found for 5.6; untested here.
+
+## Mapping notes (before the capture)
 
 - TSR's shader ids (common.hpp; placeholders and `kTsrMapped = false` until then).
 - Which pass binds depth and velocity (DilateVelocity in 5.6: t0, t1), the scene colour feed, and
