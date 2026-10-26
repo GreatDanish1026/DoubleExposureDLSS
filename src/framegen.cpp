@@ -51,8 +51,8 @@ namespace {
 
 constexpr const char* kProjectId = "6f1d6e2a-5b8c-4f2e-9a43-7c2b8e1d4a90";
 
-// Byte offsets in UE 5.6's View uniform buffer (FViewUniformShaderParameters), checked against
-// the buffer at run time (docs/FINDINGS.md).
+// Byte offsets in UE's View uniform buffer (FViewUniformShaderParameters): the same in 5.2 and 5.6
+// (its first matrices didn't move), checked against the buffer at run time (CheckCamera).
 constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 64, kViewToTranslatedWorld = 256,
                    kViewToClip = 448, kViewToClipNoAA = 512;
 
@@ -877,6 +877,11 @@ void OnDestroySwapchain(swapchain*, bool) {
 }
 
 }  // namespace
+
+bool FrameGenIsScreen(unsigned width, unsigned height) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_bbWidth && width == g_bbWidth && height == g_bbHeight;
+}
 
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
     std::lock_guard<std::mutex> lock(g_mutex);

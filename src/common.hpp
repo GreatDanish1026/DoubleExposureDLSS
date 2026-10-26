@@ -60,6 +60,8 @@ void DrawFrameGenSettings();
 void DrawFrameGenStatus();
 // The View uniform buffer (first 16 KB) of this frame's main view, with View.ClipToPrevClip's offset.
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset);
+// True if a TSR output of this size is the picture on screen (the back buffer's size).
+bool FrameGenIsScreen(unsigned width, unsigned height);
 // This frame's depth (UE's, state depth read + shader resource) and our motion vectors (render
 // pixels, previous minus current; state non-pixel shader resource), tagged on <list>.
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned renderWidth,

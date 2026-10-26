@@ -120,6 +120,19 @@ The game's materials never set the pixel-animation flag; the animation mask stay
 **Confirmed by the user (2026-10-26): with the square-root decode the trees and the satchel look
 clean.** DLSS Super Resolution works in this game.
 
+## Frame generation (0.4.0, untested)
+
+ReunionDLSS's Streamline DLSS-G code (docs/FRAMEGEN.md there) is game-agnostic except:
+- **Two TSR views**: tags and camera came from whichever view was evaluated first in a frame. 0.4.0
+  keeps each view's View uniform buffer with its motion vectors (Link/Chain) and tags only the view
+  whose output is the back buffer's size (3840x2160), never the 4096x2160 one.
+- **Camera offsets** in the View UB (TranslatedWorldToClip 0, RelativeWorldToClip 64,
+  ViewToTranslatedWorld 256, ViewToClip 448, ViewToClipNoAA 512) are the same in 5.2 (first members
+  unchanged); ClipToPrevClip is the found 1872. CheckCamera verifies at run time.
+- **Pre-HUD picture**: the capture has the same HDR UI-composite copy as Reunion (back buffer
+  3840x2160 rgb10a2unorm copied to a same-format texture), so the hudless tag should work. The HUD
+  layer's alpha orientation is checked at run time (readback), as in Reunion.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).

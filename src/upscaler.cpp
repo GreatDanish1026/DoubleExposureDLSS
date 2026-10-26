@@ -112,6 +112,7 @@ struct StageState {
 // and ResolveHistory (in that order).
 struct Chain {
     resource depth = {0}, motion = {0}, color = {0}, mask = {0};
+    std::vector<float> view;  // this view's View uniform buffer (camera for frame generation)
 };
 
 struct __declspec(uuid("3d0f6b1e-8c42-4a57-b1e9-5a7c0d2f9e61")) ListState {
@@ -336,6 +337,7 @@ resource CopyInput(command_list* cl, resource src, resource_usage srcState, form
 // command list, so its depth and our motion vectors are found through that texture.
 struct Link {
     resource depth = {0}, motion = {0}, mask = {0};
+    std::vector<float> view;
 };
 std::map<uint64_t, Link> g_links;
 
@@ -505,7 +507,8 @@ void LogOnce(int& count, const char* fmt, uint32_t a, uint32_t b) {
 }
 
 // Records motion.hlsl before the game's DilateVelocity (same inputs) and puts its state back.
-resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity, resource* maskOut) {
+resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity, resource* maskOut,
+                       std::vector<float>* viewOut) {
     *maskOut = {0};
     static int badFormat = 0, badParams = 0;
     device* dev = cl->get_device();
@@ -542,7 +545,9 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     float params[24];
     const float* m = view.data() + g_motion.offset / 4;
     memcpy(params, m, 16 * sizeof(float));
-    FrameGenSetCamera(view.data(), g_motion.offset);
+    // Frame generation takes the camera at ResolveHistory, and only for the view on screen (the game
+    // renders a second TSR view): kept with this view's motion vectors until then.
+    *viewOut = view;
     params[16] = size[0], params[17] = size[1], params[18] = 1 / size[0], params[19] = 1 / size[1];
     const uint32_t maskMode = static_cast<uint32_t>(g_set.maskMode);
     memcpy(&params[20], &maskMode, 4);
@@ -645,7 +650,7 @@ void OnDilateVelocity(command_list* cl, ListState& s) {
     if (g_links.size() > 64) g_links.clear();
     Link& link = g_links[out.handle];
     link.depth = depth;
-    link.motion = ComputeMotion(cl, s, depth, velocity, &link.mask);
+    link.motion = ComputeMotion(cl, s, depth, velocity, &link.mask, &link.view);
 }
 
 // UE 5.2: DecimateHistory is the first pass after DilateVelocity that reads its output (t0);
@@ -658,6 +663,7 @@ void OnChainStart(command_list* cl, ListState& s) {
     s.chain.depth = it->second.depth;
     s.chain.motion = it->second.motion;  // none: TSR kept for this view
     s.chain.mask = it->second.mask;
+    s.chain.view = it->second.view;
 }
 
 void OnUpdateHistory(command_list* cl, ListState& s) {
@@ -739,8 +745,12 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     }
     Restore(cl, s);
     if (ok) {
-        FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh, in.jitterX,
-                    in.jitterY, reset);
+        // Only the view on screen: Double Exposure also runs TSR for a 4096x2160 view.
+        if (FrameGenIsScreen(out.texture.width, out.texture.height) && !chain.view.empty()) {
+            FrameGenSetCamera(chain.view.data(), g_motion.offset);
+            FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh,
+                        in.jitterX, in.jitterY, reset);
+        }
         g_resetByOutput[output.handle] = false;
         g_error.clear();
         if (++g_evaluated == 1) Log("DLSS: first frame evaluated");
