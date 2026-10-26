@@ -171,6 +171,14 @@ texture comes from UE's render target pool and is sometimes swapped (features re
 Streamline. **0.4.2 keys DLSS features and the reset/size bookkeeping by output size**, so a
 swapped texture of the same size keeps DLSS's history (untested).
 
+## 0.5.0 check (2026-10-26)
+
+User: the new overlay looks good. Log (about a minute of play, DLSS Balanced, frame generation
+Dynamic): only three DLSS features created, all at startup (3840x2160, then the Balanced render
+size, then 4096x2160), none released or recreated during play: keying by output size works.
+Dynamic moved between 2, 3 and 6 frames per rendered frame. Still three single frames without tags
+(Streamline reuses the last; frame generation pauses briefly) in about 55 s; to look into.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
