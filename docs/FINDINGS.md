@@ -107,6 +107,16 @@ TSR new output textures, so 0.2.1 reached its four-feature limit and refused the
 TSR views"; that view stayed on TSR). 0.2.2 releases features unused for 3 frames before creating
 a new one.
 
+## Object velocity encoding: square-root (0.3.0)
+
+User's comparison (0.2.2, 2026-10-26) of the three Object motion choices on the trees and the satchel:
+**square-root decode was best**. UE 5.2 writes object velocity with VELOCITY_ENCODE_GAMMA:
+encoded = sign(V) * sqrt(2|V|), then the usual `* 0.499 * 0.5 + 32767/65535`; decode
+V = sign(v) * v^2 / 2. Reunion's UE 5.6 build stores it linearly (DLSS was clean there with the
+linear decode). 0.3.0 makes square-root the default (the switch stays under Diagnosis, not saved).
+The game's materials never set the pixel-animation flag; the animation mask stays available
+(default "Animated materials", which marks nothing in the scenes seen so far).
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).

@@ -56,12 +56,14 @@ struct Settings {
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
     int maskMode = 1;      // motion.hlsl MaskMode: 0 off, 1 animated materials, 2 also moving objects
     bool showMask = false;  // debug tint, not saved
-    int objectMode = 0;     // motion.hlsl ObjectMode (diagnosis): 0 linear, 1 square-root, 2 ignored; not saved
+    // motion.hlsl ObjectMode: 1 square-root decode, right for UE 5.2 (user's comparison, 2026-10-26: least
+    // tree noise and satchel smearing); 0 linear (UE 5.6, Reunion) and 2 ignored stay for diagnosis. Not saved.
+    int objectMode = 1;
 } g_set;
 
 const char* const kMaskModeNames[] = {"Off", "Animated materials", "Animated materials and moving objects"};
 constexpr int kMaskModeCount = 3;
-const char* const kObjectModeNames[] = {"Engine, linear (as in Reunion)", "Engine, square-root decode", "Ignore (camera motion only)"};
+const char* const kObjectModeNames[] = {"Engine, linear (UE 5.6 games)", "Engine, square-root (this game)", "Ignore (camera motion only)"};
 constexpr int kObjectModeCount = 3;
 
 void LoadSettings() {
@@ -1028,8 +1030,8 @@ void DrawUpscalerSettings() {
         Log("diagnosis: object motion %s", kObjectModeNames[g_set.objectMode]);
     }
     Help("How the motion of moving objects (characters, trees in the wind, the satchel) is read from the engine. "
-         "Switch while watching them: the choice with the least smearing and noise is the right one. Not saved; "
-         "tell Claude which one won.");
+         "Square-root is right for this game (UE 5.2); the others are for diagnosis and reset to it at each "
+         "launch.");
 
 }
 

@@ -17,8 +17,8 @@ cbuffer Params : register(b0) {
     float2 InvSize;
     uint MaskMode;
     float MaskStrength;
-    uint ObjectMode;  // object velocity: 0 linear decode (UE 4.x-5.6 as used for Reunion), 1 square-root
-                      // ("gamma") decode, 2 ignored (camera motion only); a diagnosis switch
+    uint ObjectMode;  // object velocity: 1 square-root ("gamma") decode, UE 5.2's encoding (default);
+                      // 0 linear decode (UE 5.6, Reunion); 2 ignored (camera motion only)
     uint Pad;
 };
 
