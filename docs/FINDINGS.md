@@ -203,7 +203,7 @@ g_mutex while calling slShutdown; DLSS-G submitted a last command list, ReShade'
 execute_command_list event called OnExecute on the same thread, and std::mutex threw "resource
 deadlock would occur". Stack: game -> ReShade dxgi -> our add-on -> sl.interposer -> DLSS-G plugin
 -> d3d12 -> ReShade dxgi -> our add-on -> abort. 0.6.1 makes framegen.cpp's mutex recursive
-(OnExecute then sees g_ready false and returns).
+(OnExecute then sees g_ready false and returns). **User confirmed 2026-10-26: no crash at exit with 0.6.1.**
 
 ## Open
 
