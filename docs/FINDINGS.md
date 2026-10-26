@@ -133,6 +133,34 @@ ReunionDLSS's Streamline DLSS-G code (docs/FRAMEGEN.md there) is game-agnostic e
   3840x2160 rgb10a2unorm copied to a same-format texture), so the hudless tag should work. The HUD
   layer's alpha orientation is checked at run time (readback), as in Reunion.
 
+## Correction: one view, at 4096x2160 (0.4.1)
+
+The "second TSR view" was the screen itself. The game's resolution is set to **4096x2160** (DCI 4K,
+`ResolutionSizeX=4096` in GameUserSettings.ini, fullscreen): its swapchain is created at 3840x2160
+and resized to 4096x2160 a second later (ReShade.log), so a 3840x2160 TSR output exists only for
+the first frames. Releasing unused DLSS features (0.2.2) is still right; tagging only the
+back-buffer-sized view (0.4.0) is harmless.
+
+First frame generation test (0.4.0): Streamline started, the pre-HUD copy and the inverted HUD
+layer were found, but **no frames were generated** ("waiting for DLSS"): `View buffer check FAILED
+(projection 0.7031 1.3333 near 10.000)`. The View uniform buffer offsets differ from 5.6. From the
+capture (View UB, 3840x2160 at 100%):
+
+| byte | UE 5.2 |
+|---|---|
+| 0 | TranslatedWorldToClip |
+| 64 | (extra matrix, large world coordinates) |
+| 128 | RelativeWorldToClip (translation row = camera offset) |
+| 192 | ClipToRelativeWorld |
+| 256 | TranslatedWorldToView |
+| 320 | ViewToTranslatedWorld (camera axes) |
+| 384 / 448 | TranslatedWorldToCameraView / CameraViewToTranslatedWorld |
+| 512 | ViewToClip (jitter in row 2: -0.000195, 5.14e-05) |
+| 576 | ViewToClipNoAA |
+| 1872 | ClipToPrevClip (found at run time) |
+
+0.4.1 uses 0 / 128 / 320 / 512 / 576 (5.6: 0 / 64 / 256 / 448 / 512).
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
