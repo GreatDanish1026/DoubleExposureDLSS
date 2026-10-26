@@ -117,6 +117,9 @@ linear decode). 0.3.0 makes square-root the default (the switch stays under Diag
 The game's materials never set the pixel-animation flag; the animation mask stays available
 (default "Animated materials", which marks nothing in the scenes seen so far).
 
+**Confirmed by the user (2026-10-26): with the square-root decode the trees and the satchel look
+clean.** DLSS Super Resolution works in this game.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
