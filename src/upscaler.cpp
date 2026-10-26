@@ -53,12 +53,14 @@ struct Settings {
     bool enabled = false;  // remembered across launches
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
+    bool animatedMotion = true;  // velocity for vertex-animated meshes while DLSS is on
 } g_set;
 
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "AnimatedMotion", g_set.animatedMotion);
     if (!kTsrMapped) g_set.enabled = false;  // TSR's passes aren't known in this game yet
 }
 
@@ -66,6 +68,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "AnimatedMotion", g_set.animatedMotion);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -757,9 +760,96 @@ bool SetScreenPercentage(float v) {
     return true;
 }
 
+// ---------------------------------------------------------------- motion data for animated meshes
+//
+// DLSS reprojects its history with our motion vectors, which take the engine's velocity where an
+// object wrote one and the camera's motion everywhere else. Meshes animated in their vertex
+// shader (wind on foliage, some cloth) only write velocity if r.Velocity.EnableVertexDeformation
+// lets them; without it they look static, and DLSS smears or flickers them (TSR's own rejection
+// heuristics hide that). While DLSS is on this switch asks for that velocity, and puts the
+// game's values (and their SetBy priority) back when DLSS is off. The related settings are logged
+// once, for diagnosis.
+
+const wchar_t* const kVelocityLogged[] = {L"r.Velocity.EnableVertexDeformation", L"r.VertexDeformationOutputsVelocity",
+                                          L"r.BasePassOutputsVelocity",          L"r.Velocity.ForceOutput",
+                                          L"r.VelocityOutputPass",               L"r.SkinCache.Mode",
+                                          L"r.SkinCache.Allow",                  L"r.HairStrands.VelocityType"};
+const wchar_t* const kVelocityOverrides[] = {L"r.Velocity.EnableVertexDeformation", L"r.VertexDeformationOutputsVelocity"};
+
+struct VelocityFix {
+    bool logged = false;
+    bool overriding = false;
+    struct Saved {
+        std::wstring value;
+        int priority = -1;
+    };
+    std::map<std::wstring, Saved> saved;
+    std::string status;
+} g_vel;
+
+std::wstring CvarText(void* var) {
+    wchar_t buf[64] = L"?";
+    cvars::GetText(var, cvars::GetType(var), buf, 64);
+    return buf;
+}
+
+bool SetCvar(void* var, const wchar_t* value, int priority = -1) {
+    if (!cvars::Set(var, value)) return false;
+    cvars::MirrorToRenderer(reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)), var, cvars::GetType(var));
+    if (priority >= 0 && priority < 0x0a) {
+        const uint8_t p = static_cast<uint8_t>(priority);
+        cvars::SafeCopy(static_cast<uint8_t*>(var) + cvars::kFlags + 3, &p, 1);
+    }
+    return true;
+}
+
+void UpdateVelocity() {
+    if (!g_res.manager) return;
+    if (!g_vel.logged) {
+        g_vel.logged = true;
+        for (const wchar_t* name : kVelocityLogged) {
+            void* var = cvars::FindVariable(g_res.manager, name);
+            if (!var) {
+                Log("velocity: %ls not found", name);
+                continue;
+            }
+            Log("velocity: %ls = %ls (%s, set by 0x%02x)", name, CvarText(var).c_str(),
+                cvars::TypeName(cvars::GetType(var)), cvars::Priority(var));
+        }
+    }
+    const bool want = g_set.enabled && g_set.animatedMotion;
+    if (want && !g_vel.overriding) {
+        g_vel.overriding = true;
+        int taken = 0, tried = 0;
+        for (const wchar_t* name : kVelocityOverrides) {
+            void* var = cvars::FindVariable(g_res.manager, name);
+            if (!var) continue;
+            ++tried;
+            VelocityFix::Saved s{CvarText(var), cvars::Priority(var)};
+            g_vel.saved[name] = s;
+            const bool ok = SetCvar(var, L"1") && CvarText(var) == L"1";
+            taken += ok;
+            Log("velocity: %ls 1 %s (was %ls)", name, ok ? "set" : "NOT taken", s.value.c_str());
+        }
+        if (g_res.sinkFlag >= 0) cvars::RequestSinks(g_res.manager, g_res.sinkFlag);
+        g_vel.status = tried == 0 ? "the game has no such setting" : taken ? "on" : "the game refused it (see the log)";
+    } else if (!want && g_vel.overriding) {
+        g_vel.overriding = false;
+        for (auto& [name, s] : g_vel.saved) {
+            void* var = cvars::FindVariable(g_res.manager, name.c_str());
+            if (var && SetCvar(var, s.value.c_str(), s.priority)) Log("velocity: %ls back to %ls", name.c_str(), s.value.c_str());
+        }
+        g_vel.saved.clear();
+        if (g_res.sinkFlag >= 0) cvars::RequestSinks(g_res.manager, g_res.sinkFlag);
+        g_vel.status = "off";
+    }
+}
+
 // About twice a second, on ReShade's present.
 void UpdateResolution() {
     if (++g_res.presents % 30 != 0) return;
+    if (g_set.enabled && !g_res.manager && !g_res.failed && !FindScreenPercentage()) g_res.failed = true;
+    UpdateVelocity();
     const bool want = g_set.enabled && g_set.mode > kModeGame && g_set.mode < kDlssModeCount;
     if (!g_res.var) {
         if (!want || g_res.failed) return;
@@ -886,6 +976,15 @@ void DrawUpscalerSettings() {
     if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], SaveAndLog();
     Help("DLSS's model. K is NVIDIA's transformer model, sharpest in motion. A driver override in the NVIDIA App "
          "takes precedence over this.");
+
+    if (ImGui::Checkbox("Motion for animated foliage and cloth", &g_set.animatedMotion)) SaveAndLog();
+    Help("Asks the engine for motion data from meshes animated in their shaders (trees and grass in the wind, some "
+         "cloth) while DLSS is on. Without it DLSS sees them as still: noise in trees, smearing on swinging "
+         "things. The game's own value comes back when DLSS is off. Costs a little GPU time.");
+    if (!g_vel.status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", g_vel.status.c_str());
+    }
 }
 
 void DrawUpscalerStatus() {

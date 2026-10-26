@@ -55,6 +55,20 @@ Differences from 5.6 handled in 0.1.0: the chain is linked at DecimateHistory's 
 RejectShading's t8); the scene colour feed is UpdateHistory's t0 as in 5.6 (5.2 has no separate
 RejectShading feed). The output is r11g11b10f even with HDR output (DLSS accepts it).
 
+## First DLSS test (0.1.0, 2026-10-26)
+
+Log: View.ClipToPrevClip found at **byte 1872** of the View uniform buffer; NGX 310.9.16 (NVIDIA App
+override); DLAA 3840x2160, Quality 2561x1441 and Balanced 2228x1253 all evaluated; presets J/K/L/M
+switched; F9 off/on restored the game's 100% scale. No errors.
+
+User saw **noise in the trees and smearing on the character's satchel**. Likely cause: meshes animated
+in their vertex shader (wind on foliage, cloth) write no velocity, so our motion vectors give them
+the camera's motion only; TSR's rejection hides that, DLSS doesn't. 0.1.1 logs the velocity cvars
+once and, while DLSS is on, sets `r.Velocity.EnableVertexDeformation=1` (and the older
+`r.VertexDeformationOutputsVelocity`), restoring the game's values and priority when off
+(overlay switch "Motion for animated foliage and cloth", ini `AnimatedMotion`, on by default).
+Untested.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
