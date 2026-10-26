@@ -161,6 +161,15 @@ capture (View UB, 3840x2160 at 100%):
 
 0.4.1 uses 0 / 128 / 320 / 512 / 576 (5.6: 0 / 64 / 256 / 448 / 512).
 
+## Frame generation works (0.4.1, 2026-10-26)
+
+User: frames are generated in game (log: "2 frame(s) presented per game frame"; 2x and Dynamic
+tried). Not on the main menu: no TSR view to tag there, so frames are presented without generated
+ones (by design, as in Reunion; generated frames would warp flat UI). Leftovers: TSR's output
+texture comes from UE's render target pool and is sometimes swapped (features released "unused for
+2021 frames"), which recreates the DLSS feature (history reset) and leaves a frame untagged for
+Streamline; keying features by output size would avoid it.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
