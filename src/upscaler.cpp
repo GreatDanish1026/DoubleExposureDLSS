@@ -983,68 +983,77 @@ void SaveAndLog() {
         kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0]);
 }
 
+// Preset ids (NVSDK_NGX_DLSS_Hint_Render_Preset_*) and their names in the overlay.
+const char* const kPresetNames[] = {"NVIDIA default", "J", "K (recommended)", "L", "M"};
+const int kPresetIds[] = {0, 10, 11, 12, 13};
+constexpr int kPresetCount = 5;
+
+const char* PresetName(int id) {
+    if (id == 0) return "NVIDIA default";
+    static char buf[8];
+    snprintf(buf, sizeof(buf), "%c", id > 0 && id < 26 ? static_cast<char>('A' + id - 1) : '?');
+    return buf;
+}
+
 void DrawUpscalerSettings() {
     ImGui::SeparatorText("DLSS");
     ImGui::BeginDisabled(!kTsrMapped);
-    if (ImGui::Checkbox("DLSS", &g_set.enabled)) SaveAndLog();
+    if (ImGui::Checkbox("DLSS (F9)", &g_set.enabled)) SaveAndLog();
     ImGui::EndDisabled();
-    Help("NVIDIA DLSS in place of the game's TSR upscaler. F9 switches it on and off while playing.");
-    ImGui::SameLine();
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (!kTsrMapped)
-            ImGui::TextColored(kWarn, "not available yet: TSR's passes in this game are still being mapped "
-                                      "(Status tab, Capture frame)");
-        else if (!g_set.enabled)
-            ImGui::TextDisabled("off: the game's TSR");
-        else if (!g_error.empty())
-            ImGui::TextColored(kWarn, "%s", g_error.c_str());
-        else if (g_lastRender[0])
-            ImGui::TextDisabled("%ux%u to %ux%u", g_lastRender[0], g_lastRender[1], g_lastOutput[0], g_lastOutput[1]);
-        else
-            ImGui::TextDisabled("starts with the next game frame");
-    }
+    Help("NVIDIA DLSS in place of the game's TSR upscaler. F9 switches it on and off while playing, to compare.");
 
     ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Mode", &g_set.mode, kDlssModeNames, kDlssModeCount)) SaveAndLog();
-    Help("The resolution DLSS renders at, as a share of the screen's. \"Game's Resolution Scale\" uses the game's "
-         "menu setting; the others override it while DLSS is on.\n\nKeep the game's Secondary Resolution Scale at "
-         "100%, so DLSS outputs the full screen resolution.");
-    if (g_res.failed) {
-        ImGui::SameLine();
-        ImGui::TextColored(kWarn, "%s", g_res.error.c_str());
-    }
+    if (ImGui::Combo("Render resolution", &g_set.mode, kDlssModeNames, kDlssModeCount)) SaveAndLog();
+    Help("The resolution DLSS renders at, as a share of the screen's. \"Game's Resolution Scale\" keeps the game's "
+         "menu setting; the others override it while DLSS is on and give it back when DLSS is off.\n\nKeep the "
+         "game's Secondary Resolution Scale at 100%, so DLSS outputs the full screen resolution.");
+    if (g_res.failed) ImGui::TextColored(kWarn, "Render resolution: %s", g_res.error.c_str());
 
-    const char* presets[] = {"NVIDIA default", "E (older CNN model)", "J", "K (recommended)", "L", "M"};
-    const int ids[] = {0, 5, 10, 11, 12, 13};
     int cur = 2;
-    for (int i = 0; i < 6; ++i)
-        if (ids[i] == g_set.preset) cur = i;
+    for (int i = 0; i < kPresetCount; ++i)
+        if (kPresetIds[i] == g_set.preset) cur = i;
     ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Preset", &cur, presets, 6)) g_set.preset = ids[cur], SaveAndLog();
-    Help("DLSS's model. K is NVIDIA's transformer model, sharpest in motion. A driver override in the NVIDIA App "
-         "takes precedence over this.");
+    if (ImGui::Combo("Model", &cur, kPresetNames, kPresetCount)) g_set.preset = kPresetIds[cur], SaveAndLog();
+    Help("DLSS's model (preset). K is NVIDIA's transformer model, sharpest in motion. A DLSS override set in the "
+         "NVIDIA App takes precedence over this.");
+}
 
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Animation mask", &g_set.maskMode, kMaskModeNames, kMaskModeCount)) SaveAndLog();
-    Help("Tells DLSS where to trust this frame over its history, against smearing and noise on things whose motion "
-         "the engine can't describe.\n\nAnimated materials: what the game's materials flag as animated (wind on "
-         "foliage, cloth, flowing textures); TSR treats the same pixels this way.\nAnimated materials and moving "
-         "objects: every moving object as well (characters, their clothes and bags). Less smearing, slightly less "
-         "stable fine detail on them.\nOff: no mask (the 0.1.0 behaviour).");
-    ImGui::Checkbox("Show mask (debug)", &g_set.showMask);
-    Help("Tints the masked pixels red, to check that trees, cloth or the satchel are covered. Not saved.");
-
-    ImGui::SeparatorText("Diagnosis");
+void DrawUpscalerAdvanced() {
+    ImGui::SeparatorText("Motion of moving objects");
     ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::Combo("Object motion", &g_set.objectMode, kObjectModeNames, kObjectModeCount)) {
         g_resetAll = true;
         Log("diagnosis: object motion %s", kObjectModeNames[g_set.objectMode]);
     }
-    Help("How the motion of moving objects (characters, trees in the wind, the satchel) is read from the engine. "
-         "Square-root is right for this game (UE 5.2); the others are for diagnosis and reset to it at each "
-         "launch.");
+    Help("How the motion of things that move by themselves (characters, trees in the wind, cloth) is read from the "
+         "engine. Square-root is right for this game (UE 5.2); the others are for testing and go back to it at "
+         "each launch.");
 
+    ImGui::SeparatorText("Animation mask");
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Mask", &g_set.maskMode, kMaskModeNames, kMaskModeCount)) SaveAndLog();
+    Help("Tells DLSS where to trust the current frame over its history.\n\nAnimated materials: what the game's "
+         "materials flag as animated (none in the scenes tested).\nAnimated materials and moving objects: every "
+         "moving object as well; less smearing, slightly less stable fine detail on them.\nOff: no mask.");
+    ImGui::Checkbox("Show the mask in red", &g_set.showMask);
+    Help("Tints the masked pixels red. For testing; off at each launch.");
+
+    ImGui::SeparatorText("History");
+    if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
+    Help("Starts DLSS's accumulation over, as after a camera cut.");
+}
+
+std::string UpscalerHeadline(bool* warn) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    *warn = false;
+    if (!kTsrMapped) return (*warn = true), "DLSS unavailable: TSR not mapped for this game build";
+    if (!g_set.enabled) return "DLSS off: the game's TSR";
+    if (!g_error.empty()) return (*warn = true), "DLSS: " + g_error;
+    if (!g_lastRender[0]) return "DLSS on: starts with the next game frame";
+    char buf[160];
+    snprintf(buf, sizeof(buf), "DLSS on: %ux%u -> %ux%u, model %s", g_lastRender[0], g_lastRender[1], g_lastOutput[0],
+             g_lastOutput[1], PresetName(g_set.preset));
+    return buf;
 }
 
 void DrawUpscalerStatus() {
@@ -1052,13 +1061,12 @@ void DrawUpscalerStatus() {
     ImGui::TextDisabled("%s", g_set.enabled ? dlss::Status().c_str() : "off");
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        ImGui::TextDisabled("Views upscaled %llu, left to TSR %llu (menus, other views)",
+        ImGui::TextDisabled("Frames upscaled %llu, left to TSR %llu (menus, loading, first frames)",
                             static_cast<unsigned long long>(g_evaluated.load()),
                             static_cast<unsigned long long>(g_skipped.load()));
         if (g_res.var)
-            ImGui::TextDisabled("Resolution scale: %s", g_res.overriding ? "set by the DLSS mode" : "the game's");
+            ImGui::TextDisabled("Resolution scale: %s", g_res.overriding ? "set by the Render resolution choice" : "the game's");
     }
-    if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
 }
 
 }  // namespace rd

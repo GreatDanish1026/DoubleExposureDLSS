@@ -44,6 +44,9 @@ void UnregisterUpscaler();
 // Overlay: the Settings tab and the Status tab.
 void DrawUpscalerSettings();
 void DrawUpscalerStatus();
+void DrawUpscalerAdvanced();
+// One line for the top of the overlay; *warn when it's a problem.
+std::string UpscalerHeadline(bool* warn);
 
 // Overlay helpers (main.cpp), in the Tweaks add-ons' style.
 float ControlWidth();
@@ -58,6 +61,7 @@ void RegisterFrameGen();
 void UnregisterFrameGen();
 void DrawFrameGenSettings();
 void DrawFrameGenStatus();
+std::string FrameGenHeadline(bool* warn);
 // The View uniform buffer (first 16 KB) of this frame's main view, with View.ClipToPrevClip's offset.
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset);
 // True if a TSR output of this size is the picture on screen (the back buffer's size).

@@ -586,6 +586,14 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
 
 void DrawOverlay(effect_runtime*) {
     ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION);
+    bool warn = false;
+    const std::string up = rd::UpscalerHeadline(&warn);
+    if (warn) ImGui::TextColored(rd::kWarn, "%s", up.c_str());
+    else ImGui::TextUnformatted(up.c_str());
+    const std::string fg = rd::FrameGenHeadline(&warn);
+    if (warn) ImGui::TextColored(rd::kWarn, "%s", fg.c_str());
+    else ImGui::TextUnformatted(fg.c_str());
+    ImGui::Spacing();
     if (!ImGui::BeginTabBar("tabs")) return;
     if (ImGui::BeginTabItem("Settings")) {
         rd::DrawUpscalerSettings();
@@ -595,12 +603,16 @@ void DrawOverlay(effect_runtime*) {
     if (ImGui::BeginTabItem("Status")) {
         rd::DrawUpscalerStatus();
         rd::DrawFrameGenStatus();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Advanced")) {
+        rd::DrawUpscalerAdvanced();
         ImGui::SeparatorText("Frame capture");
         ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
         if (ImGui::Button("Capture frame (F10)")) StartCapture();
         ImGui::EndDisabled();
-        rd::Help("Writes every command of one frame to DoubleExposureDLSS-frame-N.txt next to the game's exe, for "
-                 "finding passes when the game updates.");
+        rd::Help("Writes every command of two frames to DoubleExposureDLSS-frame-N.txt next to the game's exe, for "
+                 "finding TSR's passes again after a game update.");
         ImGui::SameLine();
         ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
         ImGui::SeparatorText("Logs");

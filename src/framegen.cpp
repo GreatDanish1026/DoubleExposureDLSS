@@ -1014,7 +1014,7 @@ void DrawFrameGenSettings() {
     int mode = g_set.mode;
     ImGui::SetNextItemWidth(ControlWidth());
     ImGui::BeginDisabled(!kTsrMapped);
-    const bool picked = ImGui::Combo("Frame generation", &mode, kModeNames, kModeCount);
+    const bool picked = ImGui::Combo("Mode##framegen", &mode, kModeNames, kModeCount);
     ImGui::EndDisabled();
     if (picked) {
         g_set.mode = mode;
@@ -1023,25 +1023,17 @@ void DrawFrameGenSettings() {
         Log("settings: frame generation %s", kModeNames[mode]);
     }
     Help("NVIDIA DLSS Frame Generation: 2x, 3x and 4x add 1, 2 or 3 generated frames per rendered frame. Dynamic "
-         "picks the multiplier to reach the display's refresh rate.\n\nNeeds DLSS on. Switching from Off takes "
-         "a game restart; the multipliers switch right away.");
+         "picks the multiplier to reach the display's refresh rate.\n\nNeeds DLSS on, and runs in game only (not "
+         "in menus). Switching on from Off takes a game restart; the multipliers switch right away.");
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    ImGui::SameLine();
-    if (!g_set.enabled) {
-        ImGui::TextDisabled(g_ready ? "off" : "");
-    } else if (!g_ready) {
-        ImGui::TextColored(kWarn, "%s", g_initTried || g_factoryHooked ? g_status.c_str() : "restart the game to start it");
-    } else if (!g_upgraded) {
-        ImGui::TextColored(kWarn, "not running: the game's swapchain wasn't handed over (see the log)");
-    } else if (!g_fgOn) {
-        ImGui::TextDisabled("waiting for DLSS (F9)");
-    } else {
-        ImGui::TextDisabled("%u frames per rendered frame", g_state.numFramesActuallyPresented);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_set.enabled && !g_ready && !g_initTried && !g_factoryHooked)
+            ImGui::TextColored(kWarn, "Restart the game to start frame generation.");
+        if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
+            ImGui::TextColored(kWarn, "%s isn't supported here, so %s.", kModeNames[g_set.mode],
+                               kModeNames[EffectiveMode(g_set.mode)]);
     }
-    if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
-        ImGui::TextColored(kWarn, "%s isn't supported here, so %s.", kModeNames[g_set.mode],
-                           kModeNames[EffectiveMode(g_set.mode)]);
 
     float sep = g_set.separation;
     ImGui::SetNextItemWidth(ControlWidth());
@@ -1051,7 +1043,25 @@ void DrawFrameGenSettings() {
         Log("settings: object separation %.0f", g_set.separation);
     }
     Help("How far apart in depth two things must be for frame generation to move them separately. 40 (NVIDIA's "
-         "default) is about 4 m in this game, 10 about 1 m. Lower it if people moving in front of walls ghost.");
+         "default) is about 4 m, 10 about 1 m. Lower it if people moving in front of walls ghost.");
+}
+
+std::string FrameGenHeadline(bool* warn) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    *warn = false;
+    if (!g_set.enabled) return "Frame generation off";
+    if (!g_ready) {
+        *warn = true;
+        return g_initTried || g_factoryHooked ? "Frame generation: " + g_status
+                                              : std::string("Frame generation: restart the game to start it");
+    }
+    if (!g_upgraded) return (*warn = true), "Frame generation not running: the game's swapchain wasn't handed over";
+    if (!g_fgOn) return "Frame generation paused (DLSS off, menu or loading)";
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Frame generation %s: %u frames per rendered frame",
+             g_appliedMode >= 0 && g_appliedMode < kModeCount ? kModeNames[g_appliedMode] : "on",
+             g_state.numFramesActuallyPresented);
+    return buf;
 }
 
 void DrawFrameGenStatus() {
