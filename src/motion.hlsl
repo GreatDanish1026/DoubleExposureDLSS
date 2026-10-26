@@ -17,6 +17,9 @@ cbuffer Params : register(b0) {
     float2 InvSize;
     uint MaskMode;
     float MaskStrength;
+    uint ObjectMode;  // object velocity: 0 linear decode (UE 4.x-5.6 as used for Reunion), 1 square-root
+                      // ("gamma") decode, 2 ignored (camera motion only); a diagnosis switch
+    uint Pad;
 };
 
 Texture2D<float> Depth : register(t0);      // device z, reversed
@@ -34,9 +37,11 @@ void main(uint2 id : SV_DispatchThreadID) {
     float2 v = screen - prev.xy / prev.w;  // UE velocity: current minus previous, screen units
     const float4 e = Velocity[id];
     const bool written = e.x > 0;
-    if (written) {
+    if (written && ObjectMode != 2) {
         const float inv = 1.0 / (0.499 * 0.5);
         v = e.xy * inv - (32767.0 / 65535.0) * inv;
+        // VELOCITY_ENCODE_GAMMA: encoded = sign(V) * sqrt(|V|) * (2 / sqrt(2)) = sign(V) * sqrt(2|V|)
+        if (ObjectMode == 1) v = sign(v) * v * v * 0.5;
     }
     Motion[id] = -v * float2(0.5 * Size.x, -0.5 * Size.y);
 

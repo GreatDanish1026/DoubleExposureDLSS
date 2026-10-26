@@ -89,6 +89,16 @@ Animated materials and moving objects (also every pixel with object velocity). "
 tints masked pixels red in the output (tint.hlsl, after DLSS, before post-processing). Untested:
 whether Deck Nine's foliage and cloth materials set the flag is what the debug view shows.
 
+### Result (2026-10-26)
+
+"Animated materials": nothing turned red, so the game's materials don't set the pixel-animation
+flag. "Animated materials and moving objects": the trees and the satchel turned red, so they write
+object velocity (WPO velocity is on). The mask over them changed nothing: no less noise in the trees,
+no less smearing on the satchel. So the history isn't the problem; the object velocity DLSS gets for
+them likely is (the decode in motion.hlsl came from 5.6). 0.2.1 adds a diagnosis switch, "Object
+motion": linear decode (as before), square-root decode (VELOCITY_ENCODE_GAMMA), or ignore object
+velocity; and preset E (CNN) to check whether the transformer presets ignore the mask.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).

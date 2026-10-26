@@ -56,10 +56,13 @@ struct Settings {
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
     int maskMode = 1;      // motion.hlsl MaskMode: 0 off, 1 animated materials, 2 also moving objects
     bool showMask = false;  // debug tint, not saved
+    int objectMode = 0;     // motion.hlsl ObjectMode (diagnosis): 0 linear, 1 square-root, 2 ignored; not saved
 } g_set;
 
 const char* const kMaskModeNames[] = {"Off", "Animated materials", "Animated materials and moving objects"};
 constexpr int kMaskModeCount = 3;
+const char* const kObjectModeNames[] = {"Engine, linear (as in Reunion)", "Engine, square-root decode", "Ignore (camera motion only)"};
+constexpr int kObjectModeCount = 3;
 
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
@@ -436,7 +439,7 @@ bool CreateMotionPipeline(device* dev) {
     if (g_motion.pipe.handle) return true;
     if (g_motion.failed) return false;
     constant_range c = {};
-    c.count = 22;
+    c.count = 24;
     c.visibility = shader_stage::all_compute;
     descriptor_range srv = {};
     srv.count = 2;
@@ -534,7 +537,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     const resource_view uavs[2] = {View(dev, tex, format::r16g16_float, true), View(dev, mask, format::r8_unorm, true)};
     if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return {0};
 
-    float params[22];
+    float params[24];
     const float* m = view.data() + g_motion.offset / 4;
     memcpy(params, m, 16 * sizeof(float));
     FrameGenSetCamera(view.data(), g_motion.offset);
@@ -542,13 +545,16 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     const uint32_t maskMode = static_cast<uint32_t>(g_set.maskMode);
     memcpy(&params[20], &maskMode, 4);
     params[21] = 1.0f;  // mask strength
+    const uint32_t objectMode = static_cast<uint32_t>(g_set.objectMode), pad = 0;
+    memcpy(&params[22], &objectMode, 4);
+    memcpy(&params[23], &pad, 4);
 
     const resource both[2] = {tex, mask};
     const resource_usage from[2] = {resource_usage::shader_resource_non_pixel, resource_usage::shader_resource_non_pixel};
     const resource_usage to[2] = {resource_usage::unordered_access, resource_usage::unordered_access};
     cl->barrier(2, both, from, to);
     cl->bind_pipeline(pipeline_stage::all_compute, g_motion.pipe);
-    cl->push_constants(shader_stage::all_compute, g_motion.layout, 0, 0, 22, params);
+    cl->push_constants(shader_stage::all_compute, g_motion.layout, 0, 0, 24, params);
     descriptor_table_update u = {};
     u.count = 2;
     u.type = descriptor_type::shader_resource_view;
@@ -995,13 +1001,13 @@ void DrawUpscalerSettings() {
         ImGui::TextColored(kWarn, "%s", g_res.error.c_str());
     }
 
-    const char* presets[] = {"NVIDIA default", "J", "K (recommended)", "L", "M"};
-    const int ids[] = {0, 10, 11, 12, 13};
+    const char* presets[] = {"NVIDIA default", "E (older CNN model)", "J", "K (recommended)", "L", "M"};
+    const int ids[] = {0, 5, 10, 11, 12, 13};
     int cur = 2;
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 6; ++i)
         if (ids[i] == g_set.preset) cur = i;
     ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], SaveAndLog();
+    if (ImGui::Combo("Preset", &cur, presets, 6)) g_set.preset = ids[cur], SaveAndLog();
     Help("DLSS's model. K is NVIDIA's transformer model, sharpest in motion. A driver override in the NVIDIA App "
          "takes precedence over this.");
 
@@ -1014,6 +1020,16 @@ void DrawUpscalerSettings() {
          "stable fine detail on them.\nOff: no mask (the 0.1.0 behaviour).");
     ImGui::Checkbox("Show mask (debug)", &g_set.showMask);
     Help("Tints the masked pixels red, to check that trees, cloth or the satchel are covered. Not saved.");
+
+    ImGui::SeparatorText("Diagnosis");
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Object motion", &g_set.objectMode, kObjectModeNames, kObjectModeCount)) {
+        g_resetAll = true;
+        Log("diagnosis: object motion %s", kObjectModeNames[g_set.objectMode]);
+    }
+    Help("How the motion of moving objects (characters, trees in the wind, the satchel) is read from the engine. "
+         "Switch while watching them: the choice with the least smearing and noise is the right one. Not saved; "
+         "tell Claude which one won.");
 
 }
 
