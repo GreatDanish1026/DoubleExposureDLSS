@@ -12,6 +12,7 @@ struct Inputs {
     ID3D12Resource* depth = nullptr;   // render resolution, reversed Z
     ID3D12Resource* motion = nullptr;  // render resolution
     ID3D12Resource* output = nullptr;  // output resolution, UAV
+    ID3D12Resource* biasMask = nullptr;  // optional, render resolution r8: 1 = trust this frame over history
     unsigned renderWidth = 0, renderHeight = 0;
     unsigned outputWidth = 0, outputHeight = 0;
     float jitterX = 0, jitterY = 0;  // in render pixels

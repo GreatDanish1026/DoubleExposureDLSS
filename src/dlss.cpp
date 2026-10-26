@@ -203,6 +203,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
     ep.Feature.pInOutput = in.output;
     ep.pInDepth = in.depth;
     ep.pInMotionVectors = in.motion;
+    ep.pInBiasCurrentColorMask = in.biasMask;  // null: none
     ep.InJitterOffsetX = in.jitterX;
     ep.InJitterOffsetY = in.jitterY;
     ep.InRenderSubrectDimensions = {in.renderWidth, in.renderHeight};

@@ -79,6 +79,16 @@ satchel smear: (1) UE 5.2's velocity flag for pixel/vertex animation (TSR treats
 specially; DLSS has a "bias current colour" mask for exactly this), (2) the satchel being
 CPU-simulated cloth without previous positions, (3) the object velocity decode in motion.hlsl.
 
+## Animation mask (0.2.0)
+
+motion.hlsl also writes an r8 mask at render resolution, passed to DLSS as the "bias current colour"
+mask (trust this frame over history there). Source: UE 5.1+ packs a "pixel animation" flag into the
+lowest bit of the encoded velocity's w (rgba16unorm velocity: z and the rest of w hold depth); TSR
+uses it to distrust history. Overlay "Animation mask": Off / Animated materials (flag; default) /
+Animated materials and moving objects (also every pixel with object velocity). "Show mask (debug)"
+tints masked pixels red in the output (tint.hlsl, after DLSS, before post-processing). Untested:
+whether Deck Nine's foliage and cloth materials set the flag is what the debug view shows.
+
 ## Open
 
 - Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).

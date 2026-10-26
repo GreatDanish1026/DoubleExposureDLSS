@@ -38,6 +38,7 @@
 #include "cvars.hpp"
 #include "dlss.hpp"
 #include "motion_cs.h"  // kMotionCs: motion.hlsl compiled by build.ps1
+#include "tint_cs.h"    // kTintCs: tint.hlsl (mask debug view)
 #include "version.h"
 
 using namespace reshade::api;
@@ -53,12 +54,19 @@ struct Settings {
     bool enabled = false;  // remembered across launches
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
+    int maskMode = 1;      // motion.hlsl MaskMode: 0 off, 1 animated materials, 2 also moving objects
+    bool showMask = false;  // debug tint, not saved
 } g_set;
+
+const char* const kMaskModeNames[] = {"Off", "Animated materials", "Animated materials and moving objects"};
+constexpr int kMaskModeCount = 3;
 
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
+    if (g_set.maskMode < 0 || g_set.maskMode >= kMaskModeCount) g_set.maskMode = 1;
     if (!kTsrMapped) g_set.enabled = false;  // TSR's passes aren't known in this game yet
 }
 
@@ -66,6 +74,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -97,7 +106,7 @@ struct StageState {
 // One TSR run's inputs, gathered in the command list that records DecimateHistory, UpdateHistory
 // and ResolveHistory (in that order).
 struct Chain {
-    resource depth = {0}, motion = {0}, color = {0};
+    resource depth = {0}, motion = {0}, color = {0}, mask = {0};
 };
 
 struct __declspec(uuid("3d0f6b1e-8c42-4a57-b1e9-5a7c0d2f9e61")) ListState {
@@ -321,7 +330,7 @@ resource CopyInput(command_list* cl, resource src, resource_usage srcState, form
 // DilateVelocity writes a texture (u0) that DecimateHistory reads (t0), and may be recorded in another
 // command list, so its depth and our motion vectors are found through that texture.
 struct Link {
-    resource depth = {0}, motion = {0};
+    resource depth = {0}, motion = {0}, mask = {0};
 };
 std::map<uint64_t, Link> g_links;
 
@@ -354,9 +363,14 @@ struct MotionState {
     std::map<std::pair<uint64_t, int>, resource_view> views;  // by resource and kind (0 SRV, 1 UAV)
     struct Texture {
         uint32_t width = 0, height = 0;
+        format fmt = format::unknown;
         resource tex = {0};
     };
-    std::vector<Texture> textures;  // rg16f, one per size, kept until shutdown
+    std::vector<Texture> textures;  // rg16f motion and r8 mask, one per size, kept until shutdown
+    // Debug tint of the masked pixels (tint.hlsl).
+    pipeline_layout tintLayout = {0};
+    pipeline tintPipe = {0};
+    bool tintFailed = false;
 } g_motion;
 
 // ---------------------------------------------------------------- motion vectors
@@ -422,14 +436,14 @@ bool CreateMotionPipeline(device* dev) {
     if (g_motion.pipe.handle) return true;
     if (g_motion.failed) return false;
     constant_range c = {};
-    c.count = 20;
+    c.count = 22;
     c.visibility = shader_stage::all_compute;
     descriptor_range srv = {};
     srv.count = 2;
     srv.visibility = shader_stage::all_compute;
     srv.type = descriptor_type::shader_resource_view;
     descriptor_range uav = {};
-    uav.count = 1;
+    uav.count = 2;
     uav.visibility = shader_stage::all_compute;
     uav.type = descriptor_type::unordered_access_view;
     const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
@@ -448,19 +462,21 @@ bool CreateMotionPipeline(device* dev) {
     return true;
 }
 
-resource MotionTexture(device* dev, uint32_t w, uint32_t h) {
+// Our own render-resolution texture of <fmt> (rg16f motion vectors or r8 mask).
+resource MotionTexture(device* dev, uint32_t w, uint32_t h, format fmt = format::r16g16_float) {
     for (const MotionState::Texture& t : g_motion.textures)
-        if (t.width == w && t.height == h) return t.tex;
-    if (g_motion.textures.size() >= 8) return {0};
+        if (t.width == w && t.height == h && t.fmt == fmt) return t.tex;
+    if (g_motion.textures.size() >= 16) return {0};
     MotionState::Texture t;
-    t.width = w, t.height = h;
-    const resource_desc d(w, h, 1, 1, format::r16g16_float, 1, memory_heap::default_,
+    t.width = w, t.height = h, t.fmt = fmt;
+    const resource_desc d(w, h, 1, 1, fmt, 1, memory_heap::default_,
                           resource_usage::shader_resource | resource_usage::unordered_access);
+    const char* what = fmt == format::r8_unorm ? "animation mask" : "motion vector";
     if (!dev->create_resource(d, nullptr, resource_usage::shader_resource_non_pixel, &t.tex)) {
-        Log("couldn't create a %ux%u motion vector texture", w, h);
+        Log("couldn't create a %ux%u %s texture", w, h, what);
         return {0};
     }
-    Log("created %ux%u motion vector texture", w, h);
+    Log("created %ux%u %s texture", w, h, what);
     g_motion.textures.push_back(t);
     return t.tex;
 }
@@ -484,7 +500,8 @@ void LogOnce(int& count, const char* fmt, uint32_t a, uint32_t b) {
 }
 
 // Records motion.hlsl before the game's DilateVelocity (same inputs) and puts its state back.
-resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity) {
+resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity, resource* maskOut) {
+    *maskOut = {0};
     static int badFormat = 0, badParams = 0;
     device* dev = cl->get_device();
     if (!velocity.handle) return {0};
@@ -510,34 +527,96 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     }
     if (!CreateMotionPipeline(dev)) return {0};
     const resource tex = MotionTexture(dev, dd.texture.width, dd.texture.height);
-    if (!tex.handle) return {0};
+    const resource mask = MotionTexture(dev, dd.texture.width, dd.texture.height, format::r8_unorm);
+    if (!tex.handle || !mask.handle) return {0};
     const resource_view srvs[2] = {View(dev, depth, format::r32_float_x8_uint, false),
                                    View(dev, velocity, format::r16g16b16a16_unorm, false)};
-    const resource_view uav = View(dev, tex, format::r16g16_float, true);
-    if (!srvs[0].handle || !srvs[1].handle || !uav.handle) return {0};
+    const resource_view uavs[2] = {View(dev, tex, format::r16g16_float, true), View(dev, mask, format::r8_unorm, true)};
+    if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return {0};
 
-    float params[20];
+    float params[22];
     const float* m = view.data() + g_motion.offset / 4;
     memcpy(params, m, 16 * sizeof(float));
     FrameGenSetCamera(view.data(), g_motion.offset);
     params[16] = size[0], params[17] = size[1], params[18] = 1 / size[0], params[19] = 1 / size[1];
+    const uint32_t maskMode = static_cast<uint32_t>(g_set.maskMode);
+    memcpy(&params[20], &maskMode, 4);
+    params[21] = 1.0f;  // mask strength
 
-    cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
+    const resource both[2] = {tex, mask};
+    const resource_usage from[2] = {resource_usage::shader_resource_non_pixel, resource_usage::shader_resource_non_pixel};
+    const resource_usage to[2] = {resource_usage::unordered_access, resource_usage::unordered_access};
+    cl->barrier(2, both, from, to);
     cl->bind_pipeline(pipeline_stage::all_compute, g_motion.pipe);
-    cl->push_constants(shader_stage::all_compute, g_motion.layout, 0, 0, 20, params);
+    cl->push_constants(shader_stage::all_compute, g_motion.layout, 0, 0, 22, params);
     descriptor_table_update u = {};
     u.count = 2;
     u.type = descriptor_type::shader_resource_view;
     u.descriptors = srvs;
     cl->push_descriptors(shader_stage::all_compute, g_motion.layout, 1, u);
-    u.count = 1;
+    u.count = 2;
     u.type = descriptor_type::unordered_access_view;
-    u.descriptors = &uav;
+    u.descriptors = uavs;
     cl->push_descriptors(shader_stage::all_compute, g_motion.layout, 2, u);
     cl->dispatch((static_cast<uint32_t>(size[0]) + 7) / 8, (static_cast<uint32_t>(size[1]) + 7) / 8, 1);
-    cl->barrier(tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
+    cl->barrier(2, both, to, from);
     Restore(cl, s);
+    *maskOut = mask;
     return tex;
+}
+
+// ---------------------------------------------------------------- mask debug view
+
+bool CreateTintPipeline(device* dev) {
+    if (g_motion.tintPipe.handle) return true;
+    if (g_motion.tintFailed) return false;
+    constant_range c = {};
+    c.count = 4;
+    c.visibility = shader_stage::all_compute;
+    descriptor_range srv = {};
+    srv.count = 1;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = {};
+    uav.count = 1;
+    uav.visibility = shader_stage::all_compute;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kTintCs;
+    cs.code_size = sizeof(kTintCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+    if (!dev->create_pipeline_layout(3, params, &g_motion.tintLayout) ||
+        !dev->create_pipeline(g_motion.tintLayout, 1, &sub, &g_motion.tintPipe)) {
+        g_motion.tintFailed = true;
+        Log("couldn't create the mask debug shader");
+        return false;
+    }
+    return true;
+}
+
+// Tints <output> (in the unordered access state) red where <mask> is set.
+void TintMask(command_list* cl, resource output, resource mask, unsigned renderW, unsigned renderH) {
+    device* dev = cl->get_device();
+    if (!mask.handle || !CreateTintPipeline(dev)) return;
+    const resource_desc od = dev->get_resource_desc(output);
+    const resource_view srv = View(dev, mask, format::r8_unorm, false);
+    const resource_view uav = View(dev, output, od.texture.format, true);
+    if (!srv.handle || !uav.handle) return;
+    const float params[4] = {static_cast<float>(od.texture.width), static_cast<float>(od.texture.height),
+                             static_cast<float>(renderW) / od.texture.width, static_cast<float>(renderH) / od.texture.height};
+    cl->bind_pipeline(pipeline_stage::all_compute, g_motion.tintPipe);
+    cl->push_constants(shader_stage::all_compute, g_motion.tintLayout, 0, 0, 4, params);
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = &srv;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.tintLayout, 1, u);
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = &uav;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.tintLayout, 2, u);
+    cl->dispatch((od.texture.width + 7) / 8, (od.texture.height + 7) / 8, 1);
+    cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
 }
 
 void OnDestroyResource(device* dev, resource r) {
@@ -558,7 +637,7 @@ void OnDilateVelocity(command_list* cl, ListState& s) {
     if (g_links.size() > 64) g_links.clear();
     Link& link = g_links[out.handle];
     link.depth = depth;
-    link.motion = ComputeMotion(cl, s, depth, velocity);
+    link.motion = ComputeMotion(cl, s, depth, velocity, &link.mask);
 }
 
 // UE 5.2: DecimateHistory is the first pass after DilateVelocity that reads its output (t0);
@@ -570,6 +649,7 @@ void OnChainStart(command_list* cl, ListState& s) {
     if (it == g_links.end()) return;
     s.chain.depth = it->second.depth;
     s.chain.motion = it->second.motion;  // none: TSR kept for this view
+    s.chain.mask = it->second.mask;
 }
 
 void OnUpdateHistory(command_list* cl, ListState& s) {
@@ -634,6 +714,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.motion = reinterpret_cast<ID3D12Resource*>(chain.motion.handle);
     in.depth = reinterpret_cast<ID3D12Resource*>(chain.depth.handle);
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
+    if (g_set.maskMode > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(chain.mask.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     g_lastRender[0] = rw, g_lastRender[1] = rh;
     g_lastOutput[0] = out.texture.width, g_lastOutput[1] = out.texture.height;
@@ -644,6 +725,10 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.preset = g_set.preset;
     const bool ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
+    if (ok && g_set.showMask) {
+        cl->bind_descriptor_tables(shader_stage::all_compute, s.compute.layout, 0, 0, nullptr);  // ReShade's heaps back
+        TintMask(cl, output, chain.mask, rw, rh);
+    }
     Restore(cl, s);
     if (ok) {
         FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh, in.jitterX,
@@ -691,6 +776,8 @@ void OnDestroyDevice(device* dev) {
     g_motion.views.clear();
     for (MotionState::Texture& t : g_motion.textures) dev->destroy_resource(t.tex);
     if (g_motion.pipe.handle) dev->destroy_pipeline(g_motion.pipe);
+    if (g_motion.tintPipe.handle) dev->destroy_pipeline(g_motion.tintPipe);
+    if (g_motion.tintLayout.handle) dev->destroy_pipeline_layout(g_motion.tintLayout);
     if (g_motion.layout.handle) dev->destroy_pipeline_layout(g_motion.layout);
     g_motion = MotionState();
     g_links.clear();
@@ -917,6 +1004,16 @@ void DrawUpscalerSettings() {
     if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], SaveAndLog();
     Help("DLSS's model. K is NVIDIA's transformer model, sharpest in motion. A driver override in the NVIDIA App "
          "takes precedence over this.");
+
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Animation mask", &g_set.maskMode, kMaskModeNames, kMaskModeCount)) SaveAndLog();
+    Help("Tells DLSS where to trust this frame over its history, against smearing and noise on things whose motion "
+         "the engine can't describe.\n\nAnimated materials: what the game's materials flag as animated (wind on "
+         "foliage, cloth, flowing textures); TSR treats the same pixels this way.\nAnimated materials and moving "
+         "objects: every moving object as well (characters, their clothes and bags). Less smearing, slightly less "
+         "stable fine detail on them.\nOff: no mask (the 0.1.0 behaviour).");
+    ImGui::Checkbox("Show mask (debug)", &g_set.showMask);
+    Help("Tints the masked pixels red, to check that trees, cloth or the satchel are covered. Not saved.");
 
 }
 
