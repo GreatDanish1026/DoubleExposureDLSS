@@ -205,9 +205,28 @@ deadlock would occur". Stack: game -> ReShade dxgi -> our add-on -> sl.interpose
 -> d3d12 -> ReShade dxgi -> our add-on -> abort. 0.6.1 makes framegen.cpp's mutex recursive
 (OnExecute then sees g_ready false and returns). **User confirmed 2026-10-26: no crash at exit with 0.6.1.**
 
+## Separate translucency (1.0.1)
+
+A user reported that with DLSS on, UI outlines, Safi's flashlight beam, volumetric lighting and
+the floating particles in Out of the Gutter disappeared. Cause: UE 5.2 draws translucency into its
+own texture and TSR blends it in itself. In the capture, 16 draws go to a 3840x2160 rgba16f render
+target with the scene depth just before TSR. Only TSR reads that texture: UpdateHistory t1 and
+RejectShading t2. It never reaches the scene colour (UpdateHistory t0), the only colour DLSS got.
+UE 5.6 (Reunion) composes translucency before TSR, so ReunionDLSS never needed this.
+
+1.0.1 (`compose.hlsl`, run at UpdateHistory):
+- Writes `scene * t.a + t.rgb` (UE's ComposeSeparateTranslucency: premultiplied colour, alpha =
+  how much of the scene shows through) into the add-on's own rgba16f texture, which DLSS gets as
+  its colour.
+- Adds translucent coverage to a copy of the bias mask: `1 - a`, or for additive effects
+  translucency luminance / (scene luminance * 0.5).
+- The overlay's "Translucent effects" setting (Advanced) controls the mask strength: Off 0,
+  Partial 0.5 (default), Full 1.
+- If t1 isn't rgba16f, or is under a quarter of the scene's size, the colour is copied without
+  translucency, as in 1.0.0.
+
 ## Open
 
-- Whether UpdateHistory's t0 includes translucency (t1, rgba16f, may be separate translucency).
 - View.ClipToPrevClip offset (logged on the first DLSS frame).
 - Frame generation: the HUD-less copy and HUD alpha were found for 5.6; untested here.
 
