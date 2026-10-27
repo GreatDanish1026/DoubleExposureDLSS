@@ -1,4 +1,4 @@
-# DoubleExposureDLSS 1.0.0
+# DoubleExposureDLSS 1.0.2
 
 ReShade add-on for **Life is Strange: Double Exposure** (Unreal Engine 5.2, DirectX 12) that
 replaces the game's TSR upscaler with **NVIDIA DLSS** and adds **DLSS Frame Generation**. The game
@@ -15,6 +15,9 @@ with add-on support.
 - **DLSS** (F9 to switch on and off): DLSS Super Resolution 310.9.16 upscales in place of TSR.
   Motion vectors are computed by the add-on from the depth buffer and the camera, plus the
   engine's own motion of moving objects (characters, foliage in the wind, cloth).
+  The game draws its translucent effects (particles, light beams, light shafts, outlines) on a
+  separate layer that its own upscaler blends in; the add-on blends that layer in before DLSS, and
+  "Translucent effects" (Advanced) keeps DLSS from smearing them.
 - **Render resolution**: DLAA, Quality, Balanced, Performance or Ultra Performance set the render
   resolution while DLSS is on; "Game's Resolution Scale" leaves it to the game's menu. Keep the
   game's Secondary Resolution Scale at 100%.
@@ -43,7 +46,7 @@ The zip includes NVIDIA's DLSS 310.9.16 and Streamline 2.14.16 runtime files, al
 NVIDIA (the add-on checks Streamline's signature before loading it). Their licences are in
 `licenses`, and attribution is in `THIRD_PARTY_NOTICES.txt`.
 
-Tested with Steam build 16505703 at 4096x2160 with HDR on. With HDR off, frame generation may run
+Tested with Steam build 16505703 at 3840x2160 with HDR on (play at your screen's resolution: a higher one left in GameUserSettings.ini makes the game render an extra view that frame generation can't keep up with). With HDR off, frame generation may run
 without the HUD protection (the game then draws its HUD straight onto the screen, as Reunion does).
 
 To uninstall, delete those files. Logs: `DoubleExposureDLSS.log` next to the game's exe,
