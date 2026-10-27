@@ -1040,33 +1040,35 @@ void OnExecute(command_queue*, command_list* cl) {
     if (in != g_pendingInputs.end()) {
         const PendingInputs p = in->second;
         g_pendingInputs.erase(in);
-        sl::Result r = g_sl.setConstants(p.constants, *g_token, sl::ViewportHandle(0));
-        if (r != sl::Result::eOk) {
-            static int logged = 0;
-            if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
+        // Two frames' lists before one Present (a hitch): Streamline takes one set per frame and
+        // refuses different constants for the same frame, so the first one stays.
+        if (g_inputs.Has(g_frame)) {
+            ++g_tagWhy["second set in a frame, skipped"];
         } else {
-            sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
-            sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr,
-                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            const sl::Extent extent{0, 0, p.rw, p.rh};
-            // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
-            const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
-            const sl::ResourceTag tags[3] = {
-                sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
-            r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, nullptr);
+            sl::Result r = g_sl.setConstants(p.constants, *g_token, sl::ViewportHandle(0));
             if (r != sl::Result::eOk) {
                 static int logged = 0;
-                if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
+                if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
             } else {
-                if (g_inputs.Has(g_frame)) {
+                sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
+                sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr,
+                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                const sl::Extent extent{0, 0, p.rw, p.rh};
+                // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
+                const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
+                const sl::ResourceTag tags[3] = {
+                    sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+                    sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+                    sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
+                r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, nullptr);
+                if (r != sl::Result::eOk) {
                     static int logged = 0;
-                    if (logged++ < 10) Log("frame generation: two sets of inputs submitted for frame %u", g_frame);
+                    if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
+                } else {
+                    g_inputs.Set(g_frame);
+                    ++g_tagsSet;
+                    if (++g_tagged == 1) Log("frame generation: first frame tagged at submission (%ux%u)", p.rw, p.rh);
                 }
-                g_inputs.Set(g_frame);
-                ++g_tagsSet;
-                if (++g_tagged == 1) Log("frame generation: first frame tagged at submission (%ux%u)", p.rw, p.rh);
             }
         }
     }

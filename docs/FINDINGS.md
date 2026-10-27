@@ -242,3 +242,19 @@ UE 5.6 (Reunion) composes translucency before TSR, so ReunionDLSS never needed t
 
 0.0.1's capture writes every compute pass in full (bound textures by register, the first 1 KB of
 each constant buffer, the View buffer once per frame) because TSR's passes aren't known yet.
+
+## Frame generation after 1.0.1 (1.0.2)
+
+- After 1.0.1, frame generation stopped at Balanced, but only while the game ran at 4096x2160, a
+  resolution left in GameUserSettings that the menu no longer offers (the screen is 3840x2160).
+  At that size the game renders a second TSR view (3840x2160 output beside the 4096x2160 screen),
+  and the screen view was rarely upscaled. At 3840x2160 there is one view and every frame is tagged
+  (1.0.2 diagnostics, 2026-10-27, blend on and off). The 4096 case wasn't reproduced.
+- About 1 frame in 60 was left to TSR (no frame generation inputs): the 16 KB View buffer read
+  failed when the View uniform buffer sat near the end of its upload buffer. 1.0.2 reads what the
+  buffer holds and needs only the first 2.5 KB.
+- At a hitch, two frames' lists could be submitted before one Present; Streamline refused the
+  second set of constants ("Setting different 'common' constants multiple times within the same
+  frame"). 1.0.2 keeps the first set and skips the second.
+- Diagnostics: when a view is left to TSR or a frame goes without inputs, a "diag" line every
+  2 s (at most 30) gives each view's outcome by output size and the reasons.

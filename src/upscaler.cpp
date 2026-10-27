@@ -63,7 +63,6 @@ struct Settings {
     // tree noise and satchel smearing); 0 linear (UE 5.6, Reunion) and 2 ignored stay for diagnosis. Not saved.
     int objectMode = 1;
     int transMask = 1;  // translucency in the bias mask: 0 off, 1 partial, 2 full
-    bool blendTrans = true;  // compose.hlsl; off only for testing, not saved
 } g_set;
 
 const char* const kTransMaskNames[] = {"Off", "Partial (recommended)", "Full"};
@@ -256,6 +255,22 @@ bool ReadConstants(command_list* cl, const StageState& st, uint32_t param, uint3
     return true;
 }
 
+// Up to <maxCount> floats from the start of root constant buffer <param>, and zeros after the end of
+// the buffer (UE's View uniform buffer may sit near the end of its upload buffer, too close for the
+// whole scan). Returns how many floats were read.
+uint32_t ReadConstantsUpTo(command_list* cl, const StageState& st, uint32_t param, float* out, uint32_t maxCount) {
+    auto it = st.roots.find(param);
+    if (it == st.roots.end() || it->second.type != descriptor_type::constant_buffer) return 0;
+    device* dev = cl->get_device();
+    const buffer_range& b = it->second.range;
+    const resource_desc bd = dev->get_resource_desc(b.buffer);
+    if (bd.type != resource_type::buffer || b.offset >= bd.buffer.size) return 0;
+    const uint32_t count = static_cast<uint32_t>((bd.buffer.size - b.offset) / 4 < maxCount ? (bd.buffer.size - b.offset) / 4 : maxCount);
+    if (!count || !ReadConstants(cl, st, param, 0, out, count)) return 0;
+    if (count < maxCount) memset(out + count, 0, (maxCount - count) * 4);
+    return count;
+}
+
 // The render size from TSR's parameters (root CBV 2, the same in every TSR pass): InputInfo is
 // UE's FScreenPassTextureViewportParameters, with the texture extent at 0, ViewportMin (uint2)
 // at 32 and ViewportSize at 48. The extent is rounded up (Balanced's 2227x1253 view sits in a
@@ -364,8 +379,9 @@ void Skip(const char* reason, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
 }
 std::string g_error;
 
-// Diagnostics, logged every couple of seconds while DLSS is on (a limited number of lines): what
-// happened to each view (by output size) and why inputs were missing.
+// Diagnostics, logged every couple of seconds while DLSS is on when a view was left to TSR or a frame
+// went without frame generation inputs (at most 30 lines): what happened to each view (by output
+// size) and why inputs were missing.
 struct ViewStats {
     uint32_t evaluated = 0, tagged = 0, noOutput = 0, noDepth = 0, noMotion = 0, noColor = 0, other = 0;
 };
@@ -384,6 +400,9 @@ float g_lastJitter[2] = {0, 0};
 unsigned g_lastRender[2] = {0, 0}, g_lastOutput[2] = {0, 0};  // sizes of the last view DLSS upscaled
 
 constexpr uint32_t kViewScanFloats = 4096;  // the first 16 KB of the View uniform buffer
+// What's needed from it: ClipToPrevClip (byte 1872 here) and the jitter row after it, and the
+// camera matrices frame generation uses (up to byte 640).
+constexpr uint32_t kViewNeededFloats = 640;
 
 struct MotionState {
     pipeline_layout layout = {0};
@@ -562,7 +581,9 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
         return {0};
     }
     static std::vector<float> view(kViewScanFloats);
-    if (!ReadConstants(cl, s.compute, 3, 0, view.data(), kViewScanFloats)) return Why("motion: View buffer"), resource{0};
+    const uint32_t viewFloats = ReadConstantsUpTo(cl, s.compute, 3, view.data(), kViewScanFloats);
+    if (viewFloats < kViewNeededFloats || (g_motion.offset >= 0 && viewFloats * 4u < static_cast<uint32_t>(g_motion.offset) + 144))
+        return Why("motion: View buffer"), resource{0};
     if (g_motion.offset < 0) {
         FindClipToPrevClip(view.data(), jitter, size);
         if (g_motion.offset < 0) return Why("motion: camera not found yet"), resource{0};
@@ -738,7 +759,6 @@ bool Compose(command_list* cl, ListState& s) {
     static int logged = 0;
     device* dev = cl->get_device();
     const resource scene = Bound(cl, s.compute, 0, 0), trans = Bound(cl, s.compute, 0, 1);
-    if (!g_set.blendTrans) return false;
     if (!scene.handle || !trans.handle || !s.chain.mask.handle) return Why("translucency: input missing"), false;
     const resource_desc sd = dev->get_resource_desc(scene), td = dev->get_resource_desc(trans);
     if (sd.type != resource_type::texture_2d || td.type != resource_type::texture_2d || !IsHdrColor(sd.texture.format) ||
@@ -1078,7 +1098,10 @@ void LogStats() {
     static uint64_t presents = 0;
     if (++presents % 120 != 0) return;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!g_set.enabled || g_statLines >= 80) {
+    const std::string fg = FrameGenDiag();  // also resets frame generation's counters
+    bool problem = !g_why.empty() || fg.find("untagged 0,") == std::string::npos;
+    for (const auto& [key, v] : g_stats) problem |= v.noOutput || v.noDepth || v.noMotion || v.noColor || v.other;
+    if (!g_set.enabled || g_statLines >= 30 || !problem) {
         g_stats.clear(), g_why.clear();
         return;
     }
@@ -1094,8 +1117,8 @@ void LogStats() {
         snprintf(buf, sizeof(buf), " {%s: %u}", why.c_str(), n);
         line += buf;
     }
-    line += FrameGenDiag();
-    ++g_statLines;
+    line += fg;
+    if (++g_statLines == 30) line += " (last diag line)";
     Log("diag (render %ux%u):%s", g_lastRender[0], g_lastRender[1], line.c_str());
     g_stats.clear(), g_why.clear();
 }
@@ -1211,12 +1234,6 @@ void DrawUpscalerAdvanced() {
     Help("Tells DLSS where to trust the current frame over its history.\n\nAnimated materials: what the game's "
          "materials flag as animated (none in the scenes tested).\nAnimated materials and moving objects: every "
          "moving object as well; less smearing, slightly less stable fine detail on them.\nOff: no mask.");
-    if (ImGui::Checkbox("Blend translucency into DLSS's input", &g_set.blendTrans)) {
-        g_resetAll = true;
-        Log("testing: translucency blend %s", g_set.blendTrans ? "on" : "off");
-    }
-    Help("Particles, light beams, light shafts and outlines are drawn on a separate layer in this game; this "
-         "blends them in before DLSS (without it they disappear with DLSS on). For testing; on at each launch.");
     ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::Combo("Translucent effects", &g_set.transMask, kTransMaskNames, kTransMaskCount)) SaveAndLog();
     Help("Adds translucent effects (particles, light beams, light shafts) to the mask. They have no motion of "
