@@ -63,6 +63,7 @@ struct Settings {
     // tree noise and satchel smearing); 0 linear (UE 5.6, Reunion) and 2 ignored stay for diagnosis. Not saved.
     int objectMode = 1;
     int transMask = 1;  // translucency in the bias mask: 0 off, 1 partial, 2 full
+    bool blendTrans = true;  // compose.hlsl; off only for testing, not saved
 } g_set;
 
 const char* const kTransMaskNames[] = {"Off", "Partial (recommended)", "Full"};
@@ -362,6 +363,17 @@ void Skip(const char* reason, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
     if (n++ < 3) Log("TSR kept for this view: %s (%u %u %u)", reason, a, b, c);
 }
 std::string g_error;
+
+// Diagnostics, logged every couple of seconds while DLSS is on (a limited number of lines): what
+// happened to each view (by output size) and why inputs were missing.
+struct ViewStats {
+    uint32_t evaluated = 0, tagged = 0, noOutput = 0, noDepth = 0, noMotion = 0, noColor = 0, other = 0;
+};
+std::map<uint64_t, ViewStats> g_stats;
+std::map<std::string, uint32_t> g_why;
+int g_statLines = 0;
+void Why(const char* reason) { ++g_why[reason]; }
+
 // Per output size (not texture: the game swaps TSR's output texture from UE's pool).
 std::map<uint64_t, bool> g_resetByOutput;
 // Render size per view: a new size (DLSS mode or menu change) starts DLSS and frame generation
@@ -534,7 +546,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     *maskOut = {0};
     static int badFormat = 0, badParams = 0;
     device* dev = cl->get_device();
-    if (!velocity.handle) return {0};
+    if (!velocity.handle) return Why("motion: no velocity"), resource{0};
     const resource_desc dd = dev->get_resource_desc(depth), vd = dev->get_resource_desc(velocity);
     if (dd.texture.format != format::r32_g8_typeless || vd.texture.format != format::r16g16b16a16_unorm) {
         LogOnce(badFormat, "motion: depth format %u, velocity format %u: TSR kept for this view",
@@ -550,19 +562,19 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
         return {0};
     }
     static std::vector<float> view(kViewScanFloats);
-    if (!ReadConstants(cl, s.compute, 3, 0, view.data(), kViewScanFloats)) return {0};
+    if (!ReadConstants(cl, s.compute, 3, 0, view.data(), kViewScanFloats)) return Why("motion: View buffer"), resource{0};
     if (g_motion.offset < 0) {
         FindClipToPrevClip(view.data(), jitter, size);
-        if (g_motion.offset < 0) return {0};
+        if (g_motion.offset < 0) return Why("motion: camera not found yet"), resource{0};
     }
     if (!CreateMotionPipeline(dev)) return {0};
     const resource tex = MotionTexture(dev, dd.texture.width, dd.texture.height);
     const resource mask = MotionTexture(dev, dd.texture.width, dd.texture.height, format::r8_unorm);
-    if (!tex.handle || !mask.handle) return {0};
+    if (!tex.handle || !mask.handle) return Why("motion: no texture (limit)"), resource{0};
     const resource_view srvs[2] = {View(dev, depth, format::r32_float_x8_uint, false),
                                    View(dev, velocity, format::r16g16b16a16_unorm, false)};
     const resource_view uavs[2] = {View(dev, tex, format::r16g16_float, true), View(dev, mask, format::r8_unorm, true)};
-    if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return {0};
+    if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return Why("motion: views"), resource{0};
 
     float params[24];
     const float* m = view.data() + g_motion.offset / 4;
@@ -681,7 +693,7 @@ void OnChainStart(command_list* cl, ListState& s) {
     s.chain = Chain();
     const resource dilated = Bound(cl, s.compute, 0, 0);
     auto it = g_links.find(dilated.handle);
-    if (it == g_links.end()) return;
+    if (it == g_links.end()) return Why("chain: DilateVelocity not seen");
     s.chain.depth = it->second.depth;
     s.chain.motion = it->second.motion;  // none: TSR kept for this view
     s.chain.mask = it->second.mask;
@@ -726,7 +738,8 @@ bool Compose(command_list* cl, ListState& s) {
     static int logged = 0;
     device* dev = cl->get_device();
     const resource scene = Bound(cl, s.compute, 0, 0), trans = Bound(cl, s.compute, 0, 1);
-    if (!scene.handle || !trans.handle || !s.chain.mask.handle) return false;
+    if (!g_set.blendTrans) return false;
+    if (!scene.handle || !trans.handle || !s.chain.mask.handle) return Why("translucency: input missing"), false;
     const resource_desc sd = dev->get_resource_desc(scene), td = dev->get_resource_desc(trans);
     if (sd.type != resource_type::texture_2d || td.type != resource_type::texture_2d || !IsHdrColor(sd.texture.format) ||
         td.texture.format != format::r16g16b16a16_float || td.texture.width * 4 < sd.texture.width ||
@@ -736,16 +749,18 @@ bool Compose(command_list* cl, ListState& s) {
         return false;
     }
     float size[2] = {0, 0};
-    if (!RenderSize(cl, s.compute, size) || size[0] > sd.texture.width || size[1] > sd.texture.height) return false;
+    if (!RenderSize(cl, s.compute, size) || size[0] > sd.texture.width || size[1] > sd.texture.height)
+        return Why("translucency: render size"), false;
     if (!CreateComposePipeline(dev)) return false;
     const resource color = MotionTexture(dev, sd.texture.width, sd.texture.height, format::r16g16b16a16_float);
     const resource mask = MotionTexture(dev, sd.texture.width, sd.texture.height, format::r8_unorm, 1);
-    if (!color.handle || !mask.handle) return false;
+    if (!color.handle || !mask.handle) return Why("translucency: no texture (limit)"), false;
     const resource_view srvs[3] = {View(dev, scene, sd.texture.format, false),
                                    View(dev, trans, format::r16g16b16a16_float, false),
                                    View(dev, s.chain.mask, format::r8_unorm, false)};
     const resource_view uavs[2] = {View(dev, color, format::r16g16b16a16_float, true), View(dev, mask, format::r8_unorm, true)};
-    if (!srvs[0].handle || !srvs[1].handle || !srvs[2].handle || !uavs[0].handle || !uavs[1].handle) return false;
+    if (!srvs[0].handle || !srvs[1].handle || !srvs[2].handle || !uavs[0].handle || !uavs[1].handle)
+        return Why("translucency: views"), false;
 
     const float params[8] = {size[0],
                              size[1],
@@ -780,11 +795,12 @@ bool Compose(command_list* cl, ListState& s) {
 }
 
 void OnUpdateHistory(command_list* cl, ListState& s) {
-    if (!s.chain.motion.handle) return;
+    if (!s.chain.motion.handle) return Why("update: no motion in this list");
     if (Compose(cl, s)) return;
     ++g_motion.copied;
     s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
                               format::r16g16b16a16_float, "color");
+    if (!s.chain.color.handle) Why("update: colour copy failed");
 }
 
 // ---------------------------------------------------------------- DLSS
@@ -794,6 +810,18 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     const Chain chain = s.chain;
     s.chain = Chain();  // used once
     const resource output = Bound(cl, s.compute, 1, 0);
+    {
+        uint64_t key = 0;
+        if (output.handle) {
+            const resource_desc od = dev->get_resource_desc(output);
+            key = (static_cast<uint64_t>(od.texture.width) << 32) | od.texture.height;
+        }
+        ViewStats& vs = g_stats[key];
+        if (!output.handle) ++vs.noOutput;
+        else if (!chain.depth.handle) ++vs.noDepth;
+        else if (!chain.motion.handle) ++vs.noMotion;
+        else if (!chain.color.handle) ++vs.noColor;
+    }
     if (!output.handle || !chain.depth.handle || !chain.motion.handle || !chain.color.handle) {
         Skip("an input is missing (output, depth, motion, colour)", output.handle != 0, chain.depth.handle != 0,
              (chain.motion.handle != 0) * 10 + (chain.color.handle != 0));
@@ -860,6 +888,11 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         TintMask(cl, output, chain.mask, rw, rh);
     }
     Restore(cl, s);
+    {
+        ViewStats& vs = g_stats[outKey];
+        if (!ok) ++vs.other;
+        else ++vs.evaluated, vs.tagged += FrameGenIsScreen(out.texture.width, out.texture.height) && !chain.view.empty();
+    }
     if (ok) {
         // Only the view on screen: Double Exposure also runs TSR for a 4096x2160 view.
         if (FrameGenIsScreen(out.texture.width, out.texture.height) && !chain.view.empty()) {
@@ -1041,7 +1074,34 @@ void UpdateResolution() {
     }
 }
 
+void LogStats() {
+    static uint64_t presents = 0;
+    if (++presents % 120 != 0) return;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (!g_set.enabled || g_statLines >= 80) {
+        g_stats.clear(), g_why.clear();
+        return;
+    }
+    std::string line;
+    char buf[200];
+    for (const auto& [key, v] : g_stats) {
+        snprintf(buf, sizeof(buf), " [%ux%u: upscaled %u, tagged %u, no output %u, depth %u, motion %u, colour %u, failed %u]",
+                 static_cast<unsigned>(key >> 32), static_cast<unsigned>(key & 0xffffffff), v.evaluated, v.tagged,
+                 v.noOutput, v.noDepth, v.noMotion, v.noColor, v.other);
+        line += buf;
+    }
+    for (const auto& [why, n] : g_why) {
+        snprintf(buf, sizeof(buf), " {%s: %u}", why.c_str(), n);
+        line += buf;
+    }
+    line += FrameGenDiag();
+    ++g_statLines;
+    Log("diag (render %ux%u):%s", g_lastRender[0], g_lastRender[1], line.c_str());
+    g_stats.clear(), g_why.clear();
+}
+
 void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+    LogStats();
     UpdateResolution();
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
@@ -1151,6 +1211,12 @@ void DrawUpscalerAdvanced() {
     Help("Tells DLSS where to trust the current frame over its history.\n\nAnimated materials: what the game's "
          "materials flag as animated (none in the scenes tested).\nAnimated materials and moving objects: every "
          "moving object as well; less smearing, slightly less stable fine detail on them.\nOff: no mask.");
+    if (ImGui::Checkbox("Blend translucency into DLSS's input", &g_set.blendTrans)) {
+        g_resetAll = true;
+        Log("testing: translucency blend %s", g_set.blendTrans ? "on" : "off");
+    }
+    Help("Particles, light beams, light shafts and outlines are drawn on a separate layer in this game; this "
+         "blends them in before DLSS (without it they disappear with DLSS on). For testing; on at each launch.");
     ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::Combo("Translucent effects", &g_set.transMask, kTransMaskNames, kTransMaskCount)) SaveAndLog();
     Help("Adds translucent effects (particles, light beams, light shafts) to the mask. They have no motion of "

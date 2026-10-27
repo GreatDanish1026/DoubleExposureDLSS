@@ -66,6 +66,7 @@ std::string FrameGenHeadline(bool* warn);
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset);
 // True if a TSR output of this size is the picture on screen (the back buffer's size).
 bool FrameGenIsScreen(unsigned width, unsigned height);
+std::string FrameGenDiag();  // diagnostics for the upscaler's diag line
 // This frame's depth (UE's, state depth read + shader resource) and our motion vectors (render
 // pixels, previous minus current; state non-pixel shader resource), tagged on <list>.
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned renderWidth,

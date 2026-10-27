@@ -216,6 +216,9 @@ void DestroyMask(device* dev) {
 bool g_fgOn = false;                  // what Streamline was last told
 std::atomic<uint64_t> g_presents{0}, g_tagged{0};
 uint32_t g_untagged = 0;  // game frames in a row without inputs
+// Diagnostics (upscaler.cpp's diag line): tag calls that returned early, tags set, frames untagged.
+std::map<std::string, uint32_t> g_tagWhy;
+uint32_t g_tagsSet = 0, g_framesUntagged = 0;
 sl::DLSSGState g_state{};  // last read on the presenting thread
 
 // The camera, copied from the View uniform buffer when our motion vectors are computed.
@@ -333,6 +336,7 @@ void BeforePresent() {
     // A frame now and then misses its inputs (another view, a hitch): frame generation only
     // pauses after several in a row (menus, loading, DLSS off), since each switch can stutter.
     g_untagged = g_inputs.Has(g_frame) ? 0 : g_untagged + 1;
+    if (g_untagged) ++g_framesUntagged;
     SetFrameGeneration(g_set.enabled && g_tagged > 0 && g_untagged < 8);
     // The overlay's status, read here: Streamline wants it read on the presenting thread.
     if (g_sl.dlssgGetState && g_presents % 30 == 0) {
@@ -925,6 +929,21 @@ void OnDestroySwapchain(swapchain*, bool) {
 
 }  // namespace
 
+std::string FrameGenDiag() {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (!g_ready) return "";
+    char buf[160];
+    snprintf(buf, sizeof(buf), " FG: screen %ux%u, tags set %u, frames untagged %u, pending %zu, %s", g_bbWidth, g_bbHeight,
+             g_tagsSet, g_framesUntagged, g_pendingInputs.size(), g_fgOn ? "on" : "paused");
+    std::string s = buf;
+    for (const auto& [why, n] : g_tagWhy) {
+        snprintf(buf, sizeof(buf), " {tag: %s %u}", why.c_str(), n);
+        s += buf;
+    }
+    g_tagWhy.clear(), g_tagsSet = 0, g_framesUntagged = 0;
+    return s;
+}
+
 bool FrameGenIsScreen(unsigned width, unsigned height) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     return g_bbWidth && width == g_bbWidth && height == g_bbHeight;
@@ -946,12 +965,13 @@ void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned rw,
                  unsigned rh, float jitterX, float jitterY, bool reset) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!g_ready || !g_set.enabled || !g_token || !g_camera.valid) return;
+    if (!g_ready || !g_set.enabled || !g_token) return;
+    if (!g_camera.valid) return void(++g_tagWhy["no camera"]);
     const Camera& cam = g_camera;
     sl::Constants c{};
     float inv[16], prevToCur[16], m[16];
     ToSl(c.cameraViewToClip, cam.m[3]);
-    if (!Invert(cam.m[3], inv) || !Invert(cam.m[4], prevToCur)) return;
+    if (!Invert(cam.m[3], inv) || !Invert(cam.m[4], prevToCur)) return void(++g_tagWhy["matrix"]);
     ToSl(c.clipToCameraView, inv);
     const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     ToSl(c.clipToLensClip, identity);
@@ -988,7 +1008,8 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
     c.minRelativeLinearDepthObjectSeparation = g_set.separation;
     // UE reuses its depth buffer later in the frame: copy it (our copy stays valid until the Present).
     ID3D12Resource* copy = DepthCopy(depth);
-    if (!copy) return;
+    if (!copy) return void(++g_tagWhy["depth copy"]);
+    if (g_pendingInputs.count(reinterpret_cast<uint64_t>(list))) ++g_tagWhy["two in one list"];
     const D3D12_RESOURCE_BARRIER before[2] = {Transition(depth, kDepthReadState, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                               Transition(copy, kDepthReadState, D3D12_RESOURCE_STATE_COPY_DEST)};
     const D3D12_RESOURCE_BARRIER after[2] = {Transition(depth, D3D12_RESOURCE_STATE_COPY_SOURCE, kDepthReadState),
@@ -1044,6 +1065,7 @@ void OnExecute(command_queue*, command_list* cl) {
                     if (logged++ < 10) Log("frame generation: two sets of inputs submitted for frame %u", g_frame);
                 }
                 g_inputs.Set(g_frame);
+                ++g_tagsSet;
                 if (++g_tagged == 1) Log("frame generation: first frame tagged at submission (%ux%u)", p.rw, p.rh);
             }
         }
