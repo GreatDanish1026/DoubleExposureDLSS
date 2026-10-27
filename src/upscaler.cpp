@@ -8,7 +8,9 @@
 //     buffer from TemporalAAJitter). DilateVelocity is recorded in a different command list, so
 //     the result is found later through its output u0, which DecimateHistory reads (t0; in UE 5.6
 //     it was RejectShading's t8).
-//   UpdateHistory (t0): the scene color with translucency -> copied into our own texture
+//   UpdateHistory (t0 scene color, t1 separate translucency): UE 5.2's TSR blends translucency
+//     (particles, light beams, light shafts, outline materials) in itself, so compose.hlsl blends
+//     it into our own copy of the scene color; it also adds the translucency to the bias mask
 //   ResolveHistory (u0): the 3840x2160 output, and from its parameters the render size, jitter and
 //     motion vector scale (offsets 0, 256 and 272, docs/FINDINGS.md). The game's pass runs first
 //     (it also writes a half-resolution copy the post-processing uses), then DLSS overwrites the
@@ -39,6 +41,7 @@
 #include "dlss.hpp"
 #include "motion_cs.h"  // kMotionCs: motion.hlsl compiled by build.ps1
 #include "tint_cs.h"    // kTintCs: tint.hlsl (mask debug view)
+#include "compose_cs.h"  // kComposeCs: compose.hlsl (translucency)
 #include "version.h"
 
 using namespace reshade::api;
@@ -59,7 +62,12 @@ struct Settings {
     // motion.hlsl ObjectMode: 1 square-root decode, right for UE 5.2 (user's comparison, 2026-10-26: least
     // tree noise and satchel smearing); 0 linear (UE 5.6, Reunion) and 2 ignored stay for diagnosis. Not saved.
     int objectMode = 1;
+    int transMask = 1;  // translucency in the bias mask: 0 off, 1 partial, 2 full
 } g_set;
+
+const char* const kTransMaskNames[] = {"Off", "Partial (recommended)", "Full"};
+constexpr int kTransMaskCount = 3;
+const float kTransMaskStrength[kTransMaskCount] = {0, 0.5f, 1};
 
 const char* const kMaskModeNames[] = {"Off", "Animated materials", "Animated materials and moving objects"};
 constexpr int kMaskModeCount = 3;
@@ -72,6 +80,8 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
     if (g_set.maskMode < 0 || g_set.maskMode >= kMaskModeCount) g_set.maskMode = 1;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
+    if (g_set.transMask < 0 || g_set.transMask >= kTransMaskCount) g_set.transMask = 1;
     if (!kTsrMapped) g_set.enabled = false;  // TSR's passes aren't known in this game yet
 }
 
@@ -80,6 +90,7 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -372,13 +383,21 @@ struct MotionState {
     struct Texture {
         uint32_t width = 0, height = 0;
         format fmt = format::unknown;
+        int slot = 0;
         resource tex = {0};
     };
-    std::vector<Texture> textures;  // rg16f motion and r8 mask, one per size, kept until shutdown
+    // rg16f motion, r8 masks (slot 0 from the motion pass, 1 with translucency) and rgba16f composed
+    // colour, one per size, kept until shutdown
+    std::vector<Texture> textures;
     // Debug tint of the masked pixels (tint.hlsl).
     pipeline_layout tintLayout = {0};
     pipeline tintPipe = {0};
     bool tintFailed = false;
+    // Translucency composite (compose.hlsl).
+    pipeline_layout composeLayout = {0};
+    pipeline composePipe = {0};
+    bool composeFailed = false;
+    uint64_t composed = 0, copied = 0;
 } g_motion;
 
 // ---------------------------------------------------------------- motion vectors
@@ -470,16 +489,18 @@ bool CreateMotionPipeline(device* dev) {
     return true;
 }
 
-// Our own render-resolution texture of <fmt> (rg16f motion vectors or r8 mask).
-resource MotionTexture(device* dev, uint32_t w, uint32_t h, format fmt = format::r16g16_float) {
+// Our own render-resolution texture of <fmt> (rg16f motion vectors, r8 mask, rgba16f colour).
+resource MotionTexture(device* dev, uint32_t w, uint32_t h, format fmt = format::r16g16_float, int slot = 0) {
     for (const MotionState::Texture& t : g_motion.textures)
-        if (t.width == w && t.height == h && t.fmt == fmt) return t.tex;
+        if (t.width == w && t.height == h && t.fmt == fmt && t.slot == slot) return t.tex;
     if (g_motion.textures.size() >= 16) return {0};
     MotionState::Texture t;
-    t.width = w, t.height = h, t.fmt = fmt;
+    t.width = w, t.height = h, t.fmt = fmt, t.slot = slot;
     const resource_desc d(w, h, 1, 1, fmt, 1, memory_heap::default_,
                           resource_usage::shader_resource | resource_usage::unordered_access);
-    const char* what = fmt == format::r8_unorm ? "animation mask" : "motion vector";
+    const char* what = fmt == format::r8_unorm             ? (slot ? "translucency mask" : "animation mask")
+                       : fmt == format::r16g16b16a16_float ? "composed colour"
+                                                           : "motion vector";
     if (!dev->create_resource(d, nullptr, resource_usage::shader_resource_non_pixel, &t.tex)) {
         Log("couldn't create a %ux%u %s texture", w, h, what);
         return {0};
@@ -667,10 +688,103 @@ void OnChainStart(command_list* cl, ListState& s) {
     s.chain.view = it->second.view;
 }
 
+// ---------------------------------------------------------------- translucency
+
+bool CreateComposePipeline(device* dev) {
+    if (g_motion.composePipe.handle) return true;
+    if (g_motion.composeFailed) return false;
+    constant_range c = {};
+    c.count = 8;
+    c.visibility = shader_stage::all_compute;
+    descriptor_range srv = {};
+    srv.count = 3;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = {};
+    uav.count = 2;
+    uav.visibility = shader_stage::all_compute;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kComposeCs;
+    cs.code_size = sizeof(kComposeCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+    if (!dev->create_pipeline_layout(3, params, &g_motion.composeLayout) ||
+        !dev->create_pipeline(g_motion.composeLayout, 1, &sub, &g_motion.composePipe)) {
+        g_motion.composeFailed = true;
+        Log("couldn't create the translucency shader: colour copied without translucency");
+        return false;
+    }
+    Log("translucency shader created");
+    return true;
+}
+
+// Blends UpdateHistory's separate translucency (t1) over its scene colour (t0) into our own
+// texture, and the translucency into a copy of the bias mask. False if the inputs aren't the
+// expected ones (then the colour is copied as before, without translucency).
+bool Compose(command_list* cl, ListState& s) {
+    static int logged = 0;
+    device* dev = cl->get_device();
+    const resource scene = Bound(cl, s.compute, 0, 0), trans = Bound(cl, s.compute, 0, 1);
+    if (!scene.handle || !trans.handle || !s.chain.mask.handle) return false;
+    const resource_desc sd = dev->get_resource_desc(scene), td = dev->get_resource_desc(trans);
+    if (sd.type != resource_type::texture_2d || td.type != resource_type::texture_2d || !IsHdrColor(sd.texture.format) ||
+        td.texture.format != format::r16g16b16a16_float || td.texture.width * 4 < sd.texture.width ||
+        td.texture.height * 4 < sd.texture.height) {
+        LogOnce(logged, "translucency: scene format %u, translucency format %u: colour copied without translucency",
+                static_cast<uint32_t>(sd.texture.format), static_cast<uint32_t>(td.texture.format));
+        return false;
+    }
+    float size[2] = {0, 0};
+    if (!RenderSize(cl, s.compute, size) || size[0] > sd.texture.width || size[1] > sd.texture.height) return false;
+    if (!CreateComposePipeline(dev)) return false;
+    const resource color = MotionTexture(dev, sd.texture.width, sd.texture.height, format::r16g16b16a16_float);
+    const resource mask = MotionTexture(dev, sd.texture.width, sd.texture.height, format::r8_unorm, 1);
+    if (!color.handle || !mask.handle) return false;
+    const resource_view srvs[3] = {View(dev, scene, sd.texture.format, false),
+                                   View(dev, trans, format::r16g16b16a16_float, false),
+                                   View(dev, s.chain.mask, format::r8_unorm, false)};
+    const resource_view uavs[2] = {View(dev, color, format::r16g16b16a16_float, true), View(dev, mask, format::r8_unorm, true)};
+    if (!srvs[0].handle || !srvs[1].handle || !srvs[2].handle || !uavs[0].handle || !uavs[1].handle) return false;
+
+    const float params[8] = {size[0],
+                             size[1],
+                             static_cast<float>(td.texture.width) / sd.texture.width,
+                             static_cast<float>(td.texture.height) / sd.texture.height,
+                             kTransMaskStrength[g_set.transMask],
+                             0,
+                             0,
+                             0};
+    const resource both[2] = {color, mask};
+    const resource_usage from[2] = {resource_usage::shader_resource_non_pixel, resource_usage::shader_resource_non_pixel};
+    const resource_usage to[2] = {resource_usage::unordered_access, resource_usage::unordered_access};
+    cl->barrier(2, both, from, to);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_motion.composePipe);
+    cl->push_constants(shader_stage::all_compute, g_motion.composeLayout, 0, 0, 8, params);
+    descriptor_table_update u = {};
+    u.count = 3;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = srvs;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.composeLayout, 1, u);
+    u.count = 2;
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = uavs;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.composeLayout, 2, u);
+    cl->dispatch((static_cast<uint32_t>(size[0]) + 7) / 8, (static_cast<uint32_t>(size[1]) + 7) / 8, 1);
+    cl->barrier(2, both, to, from);
+    Restore(cl, s);
+    s.chain.color = color;
+    s.chain.mask = mask;
+    if (++g_motion.composed == 1) Log("translucency: blended into DLSS's input");
+    return true;
+}
+
 void OnUpdateHistory(command_list* cl, ListState& s) {
-    if (s.chain.motion.handle)
-        s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
-                                  format::r16g16b16a16_float, "color");
+    if (!s.chain.motion.handle) return;
+    if (Compose(cl, s)) return;
+    ++g_motion.copied;
+    s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
+                              format::r16g16b16a16_float, "color");
 }
 
 // ---------------------------------------------------------------- DLSS
@@ -730,7 +844,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.motion = reinterpret_cast<ID3D12Resource*>(chain.motion.handle);
     in.depth = reinterpret_cast<ID3D12Resource*>(chain.depth.handle);
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
-    if (g_set.maskMode > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(chain.mask.handle);
+    if (g_set.maskMode > 0 || g_set.transMask > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(chain.mask.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     g_lastRender[0] = rw, g_lastRender[1] = rh;
     g_lastOutput[0] = out.texture.width, g_lastOutput[1] = out.texture.height;
@@ -797,6 +911,8 @@ void OnDestroyDevice(device* dev) {
     for (MotionState::Texture& t : g_motion.textures) dev->destroy_resource(t.tex);
     if (g_motion.pipe.handle) dev->destroy_pipeline(g_motion.pipe);
     if (g_motion.tintPipe.handle) dev->destroy_pipeline(g_motion.tintPipe);
+    if (g_motion.composePipe.handle) dev->destroy_pipeline(g_motion.composePipe);
+    if (g_motion.composeLayout.handle) dev->destroy_pipeline_layout(g_motion.composeLayout);
     if (g_motion.tintLayout.handle) dev->destroy_pipeline_layout(g_motion.tintLayout);
     if (g_motion.layout.handle) dev->destroy_pipeline_layout(g_motion.layout);
     g_motion = MotionState();
@@ -1035,6 +1151,12 @@ void DrawUpscalerAdvanced() {
     Help("Tells DLSS where to trust the current frame over its history.\n\nAnimated materials: what the game's "
          "materials flag as animated (none in the scenes tested).\nAnimated materials and moving objects: every "
          "moving object as well; less smearing, slightly less stable fine detail on them.\nOff: no mask.");
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Translucent effects", &g_set.transMask, kTransMaskNames, kTransMaskCount)) SaveAndLog();
+    Help("Adds translucent effects (particles, light beams, light shafts) to the mask. They have no motion of "
+         "their own, so without it DLSS can smear or ghost them over a moving background.\n\nPartial: less "
+         "ghosting, the background behind them stays smooth.\nFull: least ghosting, a little more shimmer "
+         "under large effects.\nOff: not masked (they're still drawn).");
     ImGui::Checkbox("Show the mask in red", &g_set.showMask);
     Help("Tints the masked pixels red. For testing; off at each launch.");
 
@@ -1064,6 +1186,9 @@ void DrawUpscalerStatus() {
         ImGui::TextDisabled("Frames upscaled %llu, left to TSR %llu (menus, loading, first frames)",
                             static_cast<unsigned long long>(g_evaluated.load()),
                             static_cast<unsigned long long>(g_skipped.load()));
+        if (g_motion.composed || g_motion.copied)
+            ImGui::TextDisabled("Translucency: %s", g_motion.composed ? "blended into DLSS's input"
+                                                                      : "not found (colour copied without it)");
         if (g_res.var)
             ImGui::TextDisabled("Resolution scale: %s", g_res.overriding ? "set by the Render resolution choice" : "the game's");
     }
