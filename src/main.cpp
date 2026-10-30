@@ -35,7 +35,7 @@
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS for " RD_GAME " in place of TSR (in development).";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS or FSR for " RD_GAME " in place of TSR.";
 
 namespace {
 

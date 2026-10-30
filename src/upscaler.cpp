@@ -39,6 +39,7 @@
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
 #include "cvars.hpp"
 #include "dlss.hpp"
+#include "fsr.hpp"
 #include "motion_cs.h"  // kMotionCs: motion.hlsl compiled by build.ps1
 #include "tint_cs.h"    // kTintCs: tint.hlsl (mask debug view)
 #include "compose_cs.h"  // kComposeCs: compose.hlsl (translucency)
@@ -53,8 +54,18 @@ namespace {
 
 constexpr int kToggleHotkey = VK_F9;
 
+// Which upscaler replaces TSR. Auto: DLSS if NGX starts (NVIDIA RTX), else FSR.
+enum Backend { kAuto, kDlss, kFsr, kBackendCount };
+const char* const kBackendNames[kBackendCount] = {"Auto (DLSS on NVIDIA RTX, else FSR)", "DLSS", "FSR"};
+
 struct Settings {
     bool enabled = false;  // remembered across launches
+    int backend = kAuto;   // Backend; ini key Upscaler
+    float sharpness = 0.3f;  // FSR's extra sharpening (RCAS), 0..1
+    bool fsrJitterFlip = false;  // diagnosis: FSR's jitter sign; not saved
+    bool fsrDebug = false;       // AMD's debug view; not saved
+    // FSR 3.1 stability tuning (AMD's defaults), saved: FsrVelocityFactor, FsrSwaying, FsrShadingChange
+    float fsrVelocity = 1.0f, fsrSwaying = -1.0f / 3, fsrShading = 1.0f;
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
     int maskMode = 1;      // motion.hlsl MaskMode: 0 off, 1 animated materials, 2 also moving objects
@@ -62,10 +73,21 @@ struct Settings {
     // motion.hlsl ObjectMode: 1 square-root decode, right for UE 5.2 (user's comparison, 2026-10-26: least
     // tree noise and satchel smearing); 0 linear (UE 5.6, Reunion) and 2 ignored stay for diagnosis. Not saved.
     int objectMode = 1;
-    int transMask = 1;  // translucency in the bias mask: 0 off, 1 partial, 2 full
+    int transMask = 1;  // translucency in the bias mask with DLSS: 0 off, 1 partial, 2 full
+    // With FSR: off. FSR treats the mask as "drop history here", and faint haze over dark surfaces
+    // (trees, the satchel) marked them: noise. Without it FSR showed no trails (user, 2026-10-30).
+    int fsrTransMask = 0;
 } g_set;
 
-const char* const kTransMaskNames[] = {"Off", "Partial (recommended)", "Full"};
+int g_autoBackend = 0;  // what Auto resolved to (0: not tried yet)
+
+// The translucency mask setting of the upscaler in use (DLSS's until Auto has picked).
+int& TransMask() {
+    const int b = g_set.backend != kAuto ? g_set.backend : g_autoBackend;
+    return b == kFsr ? g_set.fsrTransMask : g_set.transMask;
+}
+
+const char* const kTransMaskNames[] = {"Off", "Partial", "Full"};
 constexpr int kTransMaskCount = 3;
 const float kTransMaskStrength[kTransMaskCount] = {0, 0.5f, 1};
 
@@ -76,21 +98,39 @@ constexpr int kObjectModeCount = 3;
 
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Upscaler", g_set.backend);
+    if (g_set.backend < 0 || g_set.backend >= kBackendCount) g_set.backend = kAuto;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrSharpness", g_set.sharpness);
+    if (!(g_set.sharpness >= 0 && g_set.sharpness <= 1)) g_set.sharpness = 0.3f;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrVelocityFactor", g_set.fsrVelocity);
+    if (!(g_set.fsrVelocity >= 0 && g_set.fsrVelocity <= 1)) g_set.fsrVelocity = 1.0f;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrSwaying", g_set.fsrSwaying);
+    if (!(g_set.fsrSwaying >= -1 && g_set.fsrSwaying <= 1)) g_set.fsrSwaying = -1.0f / 3;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrShadingChange", g_set.fsrShading);
+    if (!(g_set.fsrShading >= 0 && g_set.fsrShading <= 2)) g_set.fsrShading = 1.0f;
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
     if (g_set.maskMode < 0 || g_set.maskMode >= kMaskModeCount) g_set.maskMode = 1;
     reshade::get_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
     if (g_set.transMask < 0 || g_set.transMask >= kTransMaskCount) g_set.transMask = 1;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrTranslucencyMask", g_set.fsrTransMask);
+    if (g_set.fsrTransMask < 0 || g_set.fsrTransMask >= kTransMaskCount) g_set.fsrTransMask = 0;
     if (!kTsrMapped) g_set.enabled = false;  // TSR's passes aren't known in this game yet
 }
 
 void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "Upscaler", g_set.backend);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "FsrSharpness", g_set.sharpness);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "FsrVelocityFactor", g_set.fsrVelocity);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "FsrSwaying", g_set.fsrSwaying);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "FsrShadingChange", g_set.fsrShading);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "FsrTranslucencyMask", g_set.fsrTransMask);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -786,7 +826,7 @@ bool Compose(command_list* cl, ListState& s) {
                              size[1],
                              static_cast<float>(td.texture.width) / sd.texture.width,
                              static_cast<float>(td.texture.height) / sd.texture.height,
-                             kTransMaskStrength[g_set.transMask],
+                             kTransMaskStrength[TransMask()],
                              0,
                              0,
                              0};
@@ -823,7 +863,41 @@ void OnUpdateHistory(command_list* cl, ListState& s) {
     if (!s.chain.color.handle) Why("update: colour copy failed");
 }
 
-// ---------------------------------------------------------------- DLSS
+// ---------------------------------------------------------------- DLSS / FSR
+
+int g_lastBackend = 0;  // kDlss or kFsr once one ran (0: none yet)
+
+int ActiveBackend(device* dev) {
+    if (g_set.backend == kDlss || g_set.backend == kFsr) return g_set.backend;
+    if (!g_autoBackend) {
+        std::string e;
+        g_autoBackend = dlss::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), e) ? kDlss : kFsr;
+        Log("upscaler Auto: %s%s%s", g_autoBackend == kDlss ? "DLSS" : "FSR", e.empty() ? "" : " (DLSS: ", e.empty() ? "" : (e + ")").c_str());
+    }
+    return g_autoBackend;
+}
+
+const char* BackendName(int b) { return b == kDlss ? "DLSS" : b == kFsr ? "FSR" : "Upscaler"; }
+
+// FSR wants the camera's near plane and vertical field of view. UE 5.2's View.ViewToClip is at byte
+// 512 of the View uniform buffer (docs/FINDINGS.md). UE's reversed-Z projection (row-major, row
+// vector): [1][1] = 1 / tan(fovY / 2), [3][2] = near plane. Defaults when it doesn't look right.
+constexpr int kViewToClipFloat = 512 / 4;
+
+void CameraFromView(const std::vector<float>& view, float* nearPlane, float* fovY) {
+    *nearPlane = 10, *fovY = 1.0f;
+    if (view.size() < kViewToClipFloat + 16) return;
+    const float* m = view.data() + kViewToClipFloat;
+    const float yScale = m[5], n = m[14];
+    if (std::isfinite(yScale) && yScale > 0.1f && yScale < 20) *fovY = 2 * std::atan(1 / yScale);
+    if (std::isfinite(n) && n > 0.01f && n < 1000) *nearPlane = n;
+    static int logged = 0;
+    if (logged < 1) {
+        ++logged;
+        Log("FSR camera: near %.3f, vertical FOV %.1f degrees (ViewToClip [1][1] %.4f, [2][2] %.6f (0 = infinite far), "
+            "[2][3] %.4f, [3][2] %.4f)", *nearPlane, *fovY * 57.29578f, yScale, m[10], m[11], n);
+    }
+}
 
 bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z) {
     device* dev = cl->get_device();
@@ -868,7 +942,16 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         return false;
     }
     std::string err;
-    if (!dlss::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)) {
+    const int backend = ActiveBackend(dev);
+    if (backend != g_lastBackend) {  // a different upscaler starts its own history
+        if (g_lastBackend == kDlss) dlss::ReleaseFeatures();
+        if (g_lastBackend == kFsr) fsr::ReleaseContexts();
+        if (g_lastBackend) Log("upscaler: %s", backend == kDlss ? "DLSS" : "FSR");
+        g_lastBackend = backend;
+    }
+    const bool started = backend == kDlss ? dlss::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)
+                                          : fsr::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), err);
+    if (!started) {
         g_error = err;
         ++g_skipped;
         return false;
@@ -892,7 +975,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.motion = reinterpret_cast<ID3D12Resource*>(chain.motion.handle);
     in.depth = reinterpret_cast<ID3D12Resource*>(chain.depth.handle);
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
-    if (g_set.maskMode > 0 || g_set.transMask > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(chain.mask.handle);
+    if (g_set.maskMode > 0 || TransMask() > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(chain.mask.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     g_lastRender[0] = rw, g_lastRender[1] = rh;
     g_lastOutput[0] = out.texture.width, g_lastOutput[1] = out.texture.height;
@@ -901,7 +984,27 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.motionScaleX = 1, in.motionScaleY = 1;  // motion.hlsl writes previous minus current in pixels
     in.reset = reset;
     in.preset = g_set.preset;
-    const bool ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
+    bool ok = false;
+    if (backend == kDlss) {
+        ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
+    } else {
+        fsr::Inputs fi;
+        fi.color = in.color, fi.depth = in.depth, fi.motion = in.motion, fi.output = in.output;
+        fi.reactive = in.biasMask;
+        fi.renderWidth = rw, fi.renderHeight = rh;
+        fi.outputWidth = in.outputWidth, fi.outputHeight = in.outputHeight;
+        const float sign = g_set.fsrJitterFlip ? -1.0f : 1.0f;
+        fi.jitterX = sign * jitter[0], fi.jitterY = sign * jitter[1];
+        fi.motionScaleX = 1, fi.motionScaleY = 1;
+        CameraFromView(chain.view, &fi.cameraNear, &fi.cameraFovY);
+        fi.sharpness = g_set.sharpness;
+        fi.reset = reset;
+        fi.velocityFactor = g_set.fsrVelocity;
+        fi.minDisocclusion = g_set.fsrSwaying;
+        fi.shadingChangeScale = g_set.fsrShading;
+        fi.debugView = g_set.fsrDebug;
+        ok = fsr::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), fi, err);
+    }
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
     if (ok && g_set.showMask) {
         cl->bind_descriptor_tables(shader_stage::all_compute, s.compute.layout, 0, 0, nullptr);  // ReShade's heaps back
@@ -922,12 +1025,12 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         }
         g_resetByOutput[outKey] = false;
         g_error.clear();
-        if (++g_evaluated == 1) Log("DLSS: first frame evaluated");
+        if (++g_evaluated == 1) Log("%s: first frame evaluated", backend == kDlss ? "DLSS" : "FSR");
     } else {
         ++g_skipped;
         if (g_error != err) {
             g_error = err;
-            Log("DLSS: %s", err.c_str());
+            Log("%s: %s", backend == kDlss ? "DLSS" : "FSR", err.c_str());
         }
     }
     return true;  // the game's dispatch was recorded above
@@ -958,6 +1061,8 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
 void OnDestroyDevice(device* dev) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     dlss::Shutdown();
+    fsr::Shutdown();
+    g_lastBackend = 0, g_autoBackend = 0;
     g_pool.Destroy(dev);
     for (auto& [key, v] : g_motion.views) dev->destroy_resource_view(v);
     g_motion.views.clear();
@@ -982,7 +1087,7 @@ bool g_keyWasDown = false;
 // remembered as the game's and the mode's put back.
 
 enum DlssMode { kModeGame, kModeDlaa, kModeQuality, kModeBalanced, kModePerformance, kModeUltraPerformance, kDlssModeCount };
-const char* const kDlssModeNames[kDlssModeCount] = {"Game's Resolution Scale", "DLAA (100%)", "Quality (67%)",
+const char* const kDlssModeNames[kDlssModeCount] = {"Game's Resolution Scale", "Native / DLAA (100%)", "Quality (67%)",
                                                     "Balanced (58%)", "Performance (50%)", "Ultra Performance (33%)"};
 const float kDlssModePercent[kDlssModeCount] = {0, 100, 66.667f, 58, 50, 33.333f};
 
@@ -1131,11 +1236,12 @@ void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, c
     GetWindowThreadProcessId(fg, &pid);
     const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(kToggleHotkey) & 0x8000);
     dlss::EndFrame();
+    fsr::EndFrame();
     if (down && !g_keyWasDown && kTsrMapped) {
         g_set.enabled = !g_set.enabled;
         g_resetAll = true;
         SaveSettings();
-        Log("DLSS %s (F9)", g_set.enabled ? "on" : "off");
+        Log("%s %s (F9)", BackendName(g_lastBackend), g_set.enabled ? "on" : "off");
     }
     g_keyWasDown = down;
 }
@@ -1178,7 +1284,8 @@ void UnregisterUpscaler() {
 void SaveAndLog() {
     g_resetAll = true;
     SaveSettings();
-    Log("settings: DLSS %s, preset %d, mode %s", g_set.enabled ? "on" : "off", g_set.preset,
+    Log("settings: upscaler %s (%s), DLSS preset %d, FSR sharpness %.2f, mode %s", g_set.enabled ? "on" : "off",
+        kBackendNames[g_set.backend], g_set.preset, g_set.sharpness,
         kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0]);
 }
 
@@ -1195,26 +1302,42 @@ const char* PresetName(int id) {
 }
 
 void DrawUpscalerSettings() {
-    ImGui::SeparatorText("DLSS");
+    ImGui::SeparatorText("Upscaler");
     ImGui::BeginDisabled(!kTsrMapped);
-    if (ImGui::Checkbox("DLSS (F9)", &g_set.enabled)) SaveAndLog();
+    if (ImGui::Checkbox("On (F9)", &g_set.enabled)) SaveAndLog();
     ImGui::EndDisabled();
-    Help("NVIDIA DLSS in place of the game's TSR upscaler. F9 switches it on and off while playing, to compare.");
+    Help("DLSS or FSR in place of the game's TSR upscaler. F9 switches it on and off while playing, to compare.");
+
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Upscaler", &g_set.backend, kBackendNames, kBackendCount)) SaveAndLog();
+    Help("DLSS: NVIDIA RTX graphics cards.\nFSR: any DirectX 12 graphics card. AMD's runtime picks FSR 4 on Radeon "
+         "cards that support it (RX 6000 and newer) and FSR 3.1 on the others.\nAuto: DLSS where it runs, FSR "
+         "elsewhere.");
+    const int shown = g_set.backend != kAuto ? g_set.backend : g_autoBackend;  // 0: Auto not resolved yet
 
     ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::Combo("Render resolution", &g_set.mode, kDlssModeNames, kDlssModeCount)) SaveAndLog();
-    Help("The resolution DLSS renders at, as a share of the screen's. \"Game's Resolution Scale\" keeps the game's "
-         "menu setting; the others override it while DLSS is on and give it back when DLSS is off.\n\nKeep the "
-         "game's Secondary Resolution Scale at 100%, so DLSS outputs the full screen resolution.");
+    Help("The resolution the upscaler renders at, as a share of the screen's. \"Game's Resolution Scale\" keeps "
+         "the game's menu setting; the others override it while the upscaler is on and give it back when it's "
+         "off.\n\nKeep the game's Secondary Resolution Scale at 100%, so the upscaler outputs the full screen "
+         "resolution.");
     if (g_res.failed) ImGui::TextColored(kWarn, "Render resolution: %s", g_res.error.c_str());
 
-    int cur = 2;
-    for (int i = 0; i < kPresetCount; ++i)
-        if (kPresetIds[i] == g_set.preset) cur = i;
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Model", &cur, kPresetNames, kPresetCount)) g_set.preset = kPresetIds[cur], SaveAndLog();
-    Help("DLSS's model (preset). K is NVIDIA's transformer model, sharpest in motion. A DLSS override set in the "
-         "NVIDIA App takes precedence over this.");
+    if (shown != kFsr) {
+        int cur = 2;
+        for (int i = 0; i < kPresetCount; ++i)
+            if (kPresetIds[i] == g_set.preset) cur = i;
+        ImGui::SetNextItemWidth(ControlWidth());
+        if (ImGui::Combo("DLSS model", &cur, kPresetNames, kPresetCount)) g_set.preset = kPresetIds[cur], SaveAndLog();
+        Help("DLSS's model (preset). K is NVIDIA's transformer model, sharpest in motion. A DLSS override set in the "
+             "NVIDIA App takes precedence over this.");
+    }
+    if (shown != kDlss) {
+        ImGui::SetNextItemWidth(ControlWidth());
+        if (ImGui::SliderFloat("FSR sharpness", &g_set.sharpness, 0, 1, "%.2f")) SaveSettings();
+        if (ImGui::IsItemDeactivatedAfterEdit()) Log("settings: FSR sharpness %.2f", g_set.sharpness);
+        Help("Extra sharpening after FSR (AMD's RCAS). 0 is off.");
+    }
 }
 
 void DrawUpscalerAdvanced() {
@@ -1231,46 +1354,96 @@ void DrawUpscalerAdvanced() {
     ImGui::SeparatorText("Animation mask");
     ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::Combo("Mask", &g_set.maskMode, kMaskModeNames, kMaskModeCount)) SaveAndLog();
-    Help("Tells DLSS where to trust the current frame over its history.\n\nAnimated materials: what the game's "
+    Help("Tells the upscaler where to trust the current frame over its history.\n\nAnimated materials: what the game's "
          "materials flag as animated (none in the scenes tested).\nAnimated materials and moving objects: every "
          "moving object as well; less smearing, slightly less stable fine detail on them.\nOff: no mask.");
     ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Translucent effects", &g_set.transMask, kTransMaskNames, kTransMaskCount)) SaveAndLog();
-    Help("Adds translucent effects (particles, light beams, light shafts) to the mask. They have no motion of "
-         "their own, so without it DLSS can smear or ghost them over a moving background.\n\nPartial: less "
-         "ghosting, the background behind them stays smooth.\nFull: least ghosting, a little more shimmer "
-         "under large effects.\nOff: not masked (they're still drawn).");
+    {
+        const int b = g_set.backend != kAuto ? g_set.backend : g_autoBackend;
+        const char* label = b == kFsr ? "Translucent effects (FSR)" : "Translucent effects (DLSS)";
+        if (ImGui::Combo(label, &TransMask(), kTransMaskNames, kTransMaskCount)) {
+            SaveAndLog();
+            Log("settings: translucency mask %s for %s", kTransMaskNames[TransMask()], b == kFsr ? "FSR" : "DLSS");
+        }
+    }
+    Help("Adds translucent effects (particles, light beams, light shafts) to the mask. Kept separately for DLSS "
+         "and FSR.\n\nDLSS: Partial is recommended; without it DLSS can smear or ghost them over a moving "
+         "background.\nFSR: Off is recommended; FSR reacts to the mask much more strongly, and faint haze over "
+         "dark objects (trees, the satchel) made them noisy. FSR showed no trails without it.\n\nFull: least "
+         "ghosting, more shimmer under large effects. Off: not masked (they're still drawn).");
     ImGui::Checkbox("Show the mask in red", &g_set.showMask);
     Help("Tints the masked pixels red. For testing; off at each launch.");
 
     ImGui::SeparatorText("History");
-    if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
-    Help("Starts DLSS's accumulation over, as after a camera cut.");
+    if (ImGui::Button("Reset upscaler history")) g_resetAll = true;
+    Help("Starts the upscaler's accumulation over, as after a camera cut.");
+
+    ImGui::SeparatorText("FSR");
+    if (ImGui::Checkbox("Flip FSR's jitter", &g_set.fsrJitterFlip)) {
+        g_resetAll = true;
+        Log("diagnosis: FSR jitter %s", g_set.fsrJitterFlip ? "flipped" : "as DLSS's");
+    }
+    Help("For testing: passes the camera jitter to FSR with the opposite sign. The right sign gives a steady, "
+         "sharp picture when standing still; the wrong one shimmers or blurs. Off at each launch.");
+
+    const auto tuned = [](const char* what, float v) {
+        SaveSettings();
+        Log("settings: FSR %s %.3f", what, v);
+    };
+    ImGui::SetNextItemWidth(ControlWidth());
+    ImGui::SliderFloat("Swaying detail", &g_set.fsrSwaying, -1, 1, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) tuned("swaying detail", g_set.fsrSwaying);
+    Help("FSR 3.1: how much history FSR keeps where thin moving things (leaves, branches, straps) uncover each "
+         "other. Higher: less noise and flicker around them, possibly a little ghosting. AMD's default -0.33.");
+    ImGui::SetNextItemWidth(ControlWidth());
+    ImGui::SliderFloat("Velocity factor", &g_set.fsrVelocity, 0, 1, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) tuned("velocity factor", g_set.fsrVelocity);
+    Help("FSR 3.1: how much motion lowers trust in history. Lower: steadier moving detail, possibly more "
+         "smearing. AMD's default 1.");
+    ImGui::SetNextItemWidth(ControlWidth());
+    ImGui::SliderFloat("Shading change", &g_set.fsrShading, 0, 2, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) tuned("shading change", g_set.fsrShading);
+    Help("FSR 3.1: how strongly FSR reacts to lighting changing on a surface. Lower: less noise on swaying, "
+         "lit leaves; too low can leave trails on changing light. AMD's default 1.");
+    if (ImGui::Checkbox("FSR debug view", &g_set.fsrDebug)) Log("diagnosis: FSR debug view %s", g_set.fsrDebug ? "on" : "off");
+    Help("AMD's debug overlay in place of the picture: panels with FSR's motion vectors, depth, reactive mask, "
+         "disocclusion and how much history each pixel keeps. For finding where noise comes from. Off at each "
+         "launch.");
+    if (ImGui::Button("FSR defaults")) {
+        g_set.fsrSwaying = -1.0f / 3, g_set.fsrVelocity = 1, g_set.fsrShading = 1;
+        tuned("tuning reset, swaying", g_set.fsrSwaying);
+    }
 }
 
 std::string UpscalerHeadline(bool* warn) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     *warn = false;
-    if (!kTsrMapped) return (*warn = true), "DLSS unavailable: TSR not mapped for this game build";
-    if (!g_set.enabled) return "DLSS off: the game's TSR";
-    if (!g_error.empty()) return (*warn = true), "DLSS: " + g_error;
-    if (!g_lastRender[0]) return "DLSS on: starts with the next game frame";
+    if (!kTsrMapped) return (*warn = true), "Upscaler unavailable: TSR not mapped for this game build";
+    if (!g_set.enabled) return "Upscaler off: the game's TSR";
+    const std::string name = g_lastBackend == kFsr ? fsr::VersionName() : BackendName(g_lastBackend);
+    if (!g_error.empty()) return (*warn = true), name + ": " + g_error;
+    if (!g_lastRender[0] || !g_lastBackend) return "Upscaler on: starts with the next game frame";
     char buf[160];
-    snprintf(buf, sizeof(buf), "DLSS on: %ux%u -> %ux%u, model %s", g_lastRender[0], g_lastRender[1], g_lastOutput[0],
-             g_lastOutput[1], PresetName(g_set.preset));
+    if (g_lastBackend == kDlss)
+        snprintf(buf, sizeof(buf), "DLSS on: %ux%u -> %ux%u, model %s", g_lastRender[0], g_lastRender[1],
+                 g_lastOutput[0], g_lastOutput[1], PresetName(g_set.preset));
+    else
+        snprintf(buf, sizeof(buf), "%s on: %ux%u -> %ux%u, sharpness %.2f", name.c_str(), g_lastRender[0],
+                 g_lastRender[1], g_lastOutput[0], g_lastOutput[1], g_set.sharpness);
     return buf;
 }
 
 void DrawUpscalerStatus() {
-    ImGui::SeparatorText("DLSS");
-    ImGui::TextDisabled("%s", g_set.enabled ? dlss::Status().c_str() : "off");
+    ImGui::SeparatorText("Upscaler");
+    const int b = g_lastBackend;
+    ImGui::TextDisabled("%s", !g_set.enabled ? "off" : b == kFsr ? fsr::Status().c_str() : b == kDlss ? dlss::Status().c_str() : "waiting for a game frame");
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         ImGui::TextDisabled("Frames upscaled %llu, left to TSR %llu (menus, loading, first frames)",
                             static_cast<unsigned long long>(g_evaluated.load()),
                             static_cast<unsigned long long>(g_skipped.load()));
         if (g_motion.composed || g_motion.copied)
-            ImGui::TextDisabled("Translucency: %s", g_motion.composed ? "blended into DLSS's input"
+            ImGui::TextDisabled("Translucency: %s", g_motion.composed ? "blended into the upscaler's input"
                                                                       : "not found (colour copied without it)");
         if (g_res.var)
             ImGui::TextDisabled("Resolution scale: %s", g_res.overriding ? "set by the Render resolution choice" : "the game's");

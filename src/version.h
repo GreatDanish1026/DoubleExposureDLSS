@@ -3,4 +3,4 @@
 
 #define RD_PRODUCT "DoubleExposureDLSS"  // add-on name, log file name, ReShade.ini section
 #define RD_GAME "Life is Strange: Double Exposure"
-#define RD_VERSION "1.0.2"
+#define RD_VERSION "1.1.3"
