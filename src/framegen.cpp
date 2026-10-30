@@ -38,11 +38,13 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "fsrfg.hpp"
 #include "ui_alpha_cs.h"  // kUiAlphaCs: ui_alpha.hlsl compiled by build.ps1
 #include "version.h"
 
@@ -65,7 +67,14 @@ constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 128, kView
 enum Mode : int { kOff, k2x, k3x, k4x, kDynamic, kModeCount };
 const char* const kModeNames[kModeCount] = {"Off", "2x", "3x", "4x", "Dynamic"};
 
+// Whose frame generation: NVIDIA's (Streamline, RTX 40/50) or AMD's (FSR, any DirectX 12 GPU).
+// Each replaces the game's swapchain, so the one picked at launch is used until a restart.
+enum Tech : int { kTechDlss, kTechFsr, kTechCount };
+const char* const kTechNames[kTechCount] = {"DLSS (NVIDIA RTX 40/50)", "FSR (any graphics card)"};
+const char* const kFsrModeNames[2] = {"Off", "2x"};
+
 struct Settings {
+    int tech = kTechDlss;  // ini FrameGenTech
     int mode = kOff;
     bool enabled = false;  // mode != kOff
     // sl::Constants::minRelativeLinearDepthObjectSeparation: how far apart in depth two surfaces
@@ -102,6 +111,8 @@ struct SlApi {
 // list) come back into this add-on on the same thread through ReShade's events (OnExecute). A plain
 // std::mutex throws there ("resource deadlock would occur") and the game aborted at exit (0.6.0).
 std::recursive_mutex g_mutex;
+int g_activeTech = kTechDlss;  // g_set.tech at launch
+bool Fsr() { return g_activeTech == kTechFsr; }
 bool g_initTried = false, g_ready = false;
 std::atomic<bool> g_upgraded{false};  // the game's swapchain is Streamline's proxy
 std::string g_status = "off";
@@ -135,6 +146,12 @@ struct PendingHud {
 };
 std::map<uint64_t, PendingInputs> g_pendingInputs;  // by native command list
 std::map<uint64_t, PendingHud> g_pendingHud;
+// FSR: the inputs submitted for frame g_fsrInputsFrame, handed to FSR right before its Present.
+PendingInputs g_fsrInputs;
+uint32_t g_fsrInputsFrame = UINT32_MAX;
+
+// Frames are being counted: Streamline's frame token exists, or FSR's swapchain runs.
+bool Frames() { return Fsr() ? g_ready && g_upgraded : g_token != nullptr; }
 // Our copies of UE's depth (two, alternating), the depth's size and format.
 ID3D12Resource* g_depthCopy[2] = {};
 int g_depthNext = 0;
@@ -292,6 +309,7 @@ void Marker(sl::PCLMarker m) {
 
 // The mode actually used: 3x/4x need multi-frame generation, Dynamic a recent driver.
 int EffectiveMode(int mode) {
+    if (Fsr()) return mode == kOff ? kOff : k2x;  // FSR generates one frame per rendered frame
     if (mode == kDynamic && !g_dynamicSupported) return k2x;
     if (mode >= k2x && mode <= k4x && static_cast<uint32_t>(mode) > g_maxFrames) return static_cast<int>(g_maxFrames);
     return mode;
@@ -328,9 +346,41 @@ void SetFrameGeneration(bool on) {
 
 void CheckUiRow();
 
+// FSR: this frame's inputs for FSR (from the frame's submitted command lists), then configure +
+// prepare (fsrfg.cpp).
+void BeforePresentFsr() {
+    ++g_presents;
+    const bool has = g_inputs.Has(g_frame) && g_fsrInputsFrame == g_frame;
+    g_untagged = has ? 0 : g_untagged + 1;
+    if (g_untagged) ++g_framesUntagged;
+    fsrfg::FrameInputs in;
+    if (has) {
+        const PendingInputs& p = g_fsrInputs;
+        const sl::Constants& c = p.constants;
+        in.depth = p.depth, in.motion = p.motion, in.renderWidth = p.rw, in.renderHeight = p.rh;
+        in.jitterX = c.jitterOffset.x, in.jitterY = c.jitterOffset.y;
+        in.reset = c.reset == sl::Boolean::eTrue;
+        in.cameraNear = c.cameraNear, in.cameraFovY = c.cameraFOV;
+        const float pos[3] = {c.cameraPos.x, c.cameraPos.y, c.cameraPos.z}, up[3] = {c.cameraUp.x, c.cameraUp.y, c.cameraUp.z},
+                    right[3] = {c.cameraRight.x, c.cameraRight.y, c.cameraRight.z},
+                    fwd[3] = {c.cameraFwd.x, c.cameraFwd.y, c.cameraFwd.z};
+        memcpy(in.position, pos, 12), memcpy(in.up, up, 12), memcpy(in.right, right, 12), memcpy(in.forward, fwd, 12);
+    }
+    const bool want = g_set.enabled && g_tagged > 0 && g_untagged < 8;
+    ID3D12Resource* hud = g_hudless.Has(g_frame) && g_hudlessTex.handle ? reinterpret_cast<ID3D12Resource*>(g_hudlessTex.handle) : nullptr;
+    // UE only makes the picture before the HUD with HDR output: that's how HDR is told apart (UE's
+    // SDR back buffer is 10-bit too).
+    fsrfg::BeforePresent(want, has ? &in : nullptr, hud, g_bbWidth, g_bbHeight, static_cast<DXGI_FORMAT>(g_bbFormat),
+                         g_hudlessCount > 0);
+    const bool running = fsrfg::Running();
+    if (running != g_fgOn) g_appliedMode = running ? k2x : kOff;
+    g_fgOn = running;
+}
+
 void BeforePresent() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready) return;
+    if (Fsr()) return BeforePresentFsr();
     ++g_presents;
     Marker(sl::PCLMarker::eRenderSubmitEnd);
     // A frame now and then misses its inputs (another view, a hitch): frame generation only
@@ -369,6 +419,10 @@ void AfterPresent() {
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_ready) return;
+        if (Fsr()) {
+            ++g_frame;  // FSR has no frame tokens: the next frame starts here
+            return;
+        }
         Marker(sl::PCLMarker::ePresentEnd);
         const uint32_t next = g_frame + 1;
         if (g_sl.getNewFrameToken(token, &next) != sl::Result::eOk || !token) return;
@@ -453,7 +507,7 @@ bool CalledFromStreamline(void* returnAddress) {
     GetModuleFileNameW(mod, path, MAX_PATH);
     const wchar_t* name = wcsrchr(path, L'\\');
     name = name ? name + 1 : path;
-    return _wcsnicmp(name, L"sl.", 3) == 0 || _wcsnicmp(name, L"nvngx", 5) == 0;
+    return _wcsnicmp(name, L"sl.", 3) == 0 || _wcsnicmp(name, L"nvngx", 5) == 0 || _wcsnicmp(name, L"amd_fidelityfx", 14) == 0;
 }
 
 thread_local bool t_creating = false;
@@ -508,8 +562,83 @@ void HookProxyPresent(IDXGISwapChain* sc) {
     Log("frame generation: swapchain created through Streamline%s", hooked ? "" : " (present hook FAILED)");
 }
 
+// ---------------------------------------------------------------- FSR's swapchain
+
+// Loads AMD's runtime (once) when the game creates its swapchain.
+bool EnsureFsr(IUnknown* queueOrDevice) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (g_initTried) return g_ready;
+    ID3D12CommandQueue* queue = nullptr;
+    if (!queueOrDevice || FAILED(queueOrDevice->QueryInterface(IID_PPV_ARGS(&queue)))) return false;  // not D3D12
+    queue->Release();
+    g_initTried = true;
+    std::string err;
+    if (!fsrfg::Load(err)) {
+        g_status = err;
+        Log("frame generation: %s", err.c_str());
+        return false;
+    }
+    g_ready = true;
+    g_status = "ready";
+    return true;
+}
+
+using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
+ReleaseFn g_release = nullptr;
+
+// FSR's swapchain: before the game's last reference goes, frame generation and FSR's swapchain
+// context are shut down (AMD's order). Its references are counted with AddRef + Release (AddRef
+// isn't hooked).
+ULONG STDMETHODCALLTYPE HookRelease(IUnknown* o) {
+    if (o == fsrfg::Proxy()) {
+        o->AddRef();
+        const ULONG now = g_release(o);
+        if (now <= fsrfg::OwnReferences() + 1) {
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            g_upgraded = false;
+            g_fgOn = false;
+            fsrfg::BeforeSwapchainRelease();
+        }
+    }
+    return g_release(o);
+}
+
+void HookFsrProxy(IDXGISwapChain* sc) {
+    const bool hooked = Patch(sc, 8, reinterpret_cast<void*>(&HookPresent), reinterpret_cast<void**>(&g_present)) &&
+                        Patch(sc, 22, reinterpret_cast<void*>(&HookPresent1), reinterpret_cast<void**>(&g_present1)) &&
+                        Patch(sc, 2, reinterpret_cast<void*>(&HookRelease), reinterpret_cast<void**>(&g_release));
+    g_upgraded = hooked;
+    Log("frame generation: swapchain created through FSR%s", hooked ? "" : " (present hook FAILED)");
+}
+
+// FSR creates the real swapchain through the same factory method: t_creating lets that through.
+HRESULT CreateThroughFsr(IUnknown* dev, const std::function<HRESULT(ID3D12CommandQueue*, std::string&)>& create) {
+    ID3D12CommandQueue* queue = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&queue)))) return E_NOINTERFACE;
+    std::string err;
+    t_creating = true;
+    const HRESULT hr = create(queue, err);
+    t_creating = false;
+    queue->Release();
+    if (FAILED(hr)) {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        g_status = err;
+        Log("frame generation: %s: the game's own swapchain is used", err.c_str());
+    }
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
     void* caller = _ReturnAddress();
+    if (Fsr()) {
+        if (t_creating || CalledFromStreamline(caller) || !EnsureFsr(dev)) return g_createSwapChain(f, dev, desc, out);
+        const HRESULT hr = CreateThroughFsr(dev, [&](ID3D12CommandQueue* q, std::string& e) {
+            return fsrfg::CreateSwapChain(f, q, desc, out, e);
+        });
+        if (FAILED(hr)) return g_createSwapChain(f, dev, desc, out);
+        HookFsrProxy(*out);
+        return hr;
+    }
     if (t_creating || CalledFromStreamline(caller) || !EnsureStreamline(dev)) return g_createSwapChain(f, dev, desc, out);
     void* proxy = UpgradeFactory(f);
     if (!proxy) return g_createSwapChain(f, dev, desc, out);
@@ -525,6 +654,16 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DX
 HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                             const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* output, IDXGISwapChain1** out) {
     void* caller = _ReturnAddress();
+    if (Fsr()) {
+        if (t_creating || CalledFromStreamline(caller) || output || !EnsureFsr(dev))
+            return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+        const HRESULT hr = CreateThroughFsr(dev, [&](ID3D12CommandQueue* q, std::string& e) {
+            return fsrfg::CreateSwapChainForHwnd(f, q, hwnd, desc, fs, out, e);
+        });
+        if (FAILED(hr)) return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+        HookFsrProxy(*out);
+        return hr;
+    }
     if (t_creating || CalledFromStreamline(caller) || !EnsureStreamline(dev))
         return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
     void* proxy = UpgradeFactory(f);
@@ -688,12 +827,18 @@ void OnDestroyDevice(device* dev) {
     if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
     if (g_uiReadback.handle && g_hudlessDevice == dev) dev->destroy_resource(g_uiReadback), g_uiReadback = {0};
     if (g_hudlessDevice == dev) DestroyMask(dev);
+    if (Fsr() && g_ready) fsrfg::Shutdown();  // normally done already, with the swapchain
     ReleaseDepthCopies();
     g_pendingInputs.clear(), g_pendingHud.clear();
     if (!g_ready) return;
     g_ready = false;
-    g_sl.shutdown();
     g_status = "shut down";
+    if (Fsr()) {
+        g_upgraded = false;
+        Log("frame generation: FSR shut down");
+        return;
+    }
+    g_sl.shutdown();
     Log("frame generation: Streamline shut down");
 }
 
@@ -881,7 +1026,7 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     const resource_desc dd = dev->get_resource_desc(dst);
     if (dd.texture.width != g_bbWidth || dd.texture.height != g_bbHeight || dd.texture.format != g_bbFormat) return false;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!g_token) return false;
+    if (!Frames()) return false;
     if (!g_hudlessTex.handle) {
         const resource_desc d(g_bbWidth, g_bbHeight, 1, 1, g_bbFormat, 1, memory_heap::default_,
                               resource_usage::shader_resource | resource_usage::copy_dest);
@@ -965,7 +1110,7 @@ void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned rw,
                  unsigned rh, float jitterX, float jitterY, bool reset) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!g_ready || !g_set.enabled || !g_token) return;
+    if (!g_ready || !g_set.enabled || !Frames()) return;
     if (!g_camera.valid) return void(++g_tagWhy["no camera"]);
     const Camera& cam = g_camera;
     sl::Constants c{};
@@ -1032,9 +1177,28 @@ void OnExecute(command_queue*, command_list* cl) {
     auto in = g_pendingInputs.find(key);
     auto hud = g_pendingHud.find(key);
     if (in == g_pendingInputs.end() && hud == g_pendingHud.end()) return;
-    if (!g_ready || !g_token) {
+    if (!g_ready || !Frames()) {
         if (in != g_pendingInputs.end()) g_pendingInputs.erase(in);
         if (hud != g_pendingHud.end()) g_pendingHud.erase(hud);
+        return;
+    }
+    if (Fsr()) {  // kept for FSR, which gets them right before this frame's Present
+        if (in != g_pendingInputs.end()) {
+            if (g_inputs.Has(g_frame)) {
+                ++g_tagWhy["second set in a frame, skipped"];
+            } else {
+                g_fsrInputs = in->second;
+                g_fsrInputsFrame = g_frame;
+                g_inputs.Set(g_frame);
+                ++g_tagsSet;
+                if (++g_tagged == 1) Log("frame generation: first frame's inputs submitted (%ux%u)", in->second.rw, in->second.rh);
+            }
+            g_pendingInputs.erase(in);
+        }
+        if (hud != g_pendingHud.end()) {
+            g_pendingHud.erase(hud);
+            if (g_hudlessTex.handle) g_hudless.Set(g_frame), ++g_hudlessCount;
+        }
         return;
     }
     if (in != g_pendingInputs.end()) {
@@ -1107,7 +1271,11 @@ void RegisterFrameGen() {
     if (g_set.mode < kOff || g_set.mode >= kModeCount) g_set.mode = kOff;
     reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectSeparation", g_set.separation);
     if (!(g_set.separation >= 1 && g_set.separation <= 100)) g_set.separation = 40;
-    g_set.enabled = g_set.mode != kOff && kTsrMapped;  // needs DLSS, which needs TSR mapped
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGenTech", g_set.tech);
+    if (g_set.tech < 0 || g_set.tech >= kTechCount) g_set.tech = kTechDlss;
+    g_activeTech = g_set.tech;  // until the next launch
+    g_set.enabled = g_set.mode != kOff && kTsrMapped;  // needs the upscaler, which needs TSR mapped
+    if (g_set.enabled) Log("frame generation: %s, %s", kTechNames[g_activeTech], kModeNames[EffectiveMode(g_set.mode)]);
     reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
@@ -1138,10 +1306,30 @@ void UnregisterFrameGen() {
 
 void DrawFrameGenSettings() {
     ImGui::SeparatorText("Frame generation");
-    int mode = g_set.mode;
-    ImGui::SetNextItemWidth(ControlWidth());
     ImGui::BeginDisabled(!kTsrMapped);
-    const bool picked = ImGui::Combo("Mode##framegen", &mode, kModeNames, kModeCount);
+    int tech = g_set.tech;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Technology##framegen", &tech, kTechNames, kTechCount)) {
+        g_set.tech = tech;
+        if (tech == kTechFsr && g_set.mode > k2x) g_set.mode = k2x, reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", g_set.mode);
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenTech", tech);
+        Log("settings: frame generation technology %s (from the next launch)", kTechNames[tech]);
+    }
+    Help("DLSS: NVIDIA's frame generation, RTX 40 and 50 series. Up to 4x, with NVIDIA Reflex for low latency.\n"
+         "FSR: AMD's frame generation, any DirectX 12 graphics card (FSR 4 on Radeon RX 9000 under Windows 11, "
+         "FSR 3.1 elsewhere). 2x, no Reflex (a little more latency).\n\nWorks with either upscaler. Takes effect "
+         "at the next game launch.");
+
+    int mode = g_set.mode;
+    bool picked = false;
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (g_set.tech == kTechFsr) {
+        int fsrMode = mode == kOff ? 0 : 1;
+        picked = ImGui::Combo("Mode##framegen", &fsrMode, kFsrModeNames, 2);
+        mode = fsrMode ? k2x : kOff;
+    } else {
+        picked = ImGui::Combo("Mode##framegen", &mode, kModeNames, kModeCount);
+    }
     ImGui::EndDisabled();
     if (picked) {
         g_set.mode = mode;
@@ -1149,18 +1337,26 @@ void DrawFrameGenSettings() {
         reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", mode);
         Log("settings: frame generation %s", kModeNames[mode]);
     }
-    Help("NVIDIA DLSS Frame Generation: 2x, 3x and 4x add 1, 2 or 3 generated frames per rendered frame. Dynamic "
-         "picks the multiplier to reach the display's refresh rate.\n\nNeeds DLSS on, and runs in game only (not "
-         "in menus). Switching on from Off takes a game restart; the multipliers switch right away.");
+    if (g_set.tech == kTechFsr)
+        Help("AMD FSR Frame Generation: 2x adds one generated frame per rendered frame.\n\nNeeds the upscaler on, "
+             "and runs in game only (not in menus). Switching on from Off takes a game restart.");
+    else
+        Help("NVIDIA DLSS Frame Generation: 2x, 3x and 4x add 1, 2 or 3 generated frames per rendered frame. "
+             "Dynamic picks the multiplier to reach the display's refresh rate.\n\nNeeds the upscaler on, and runs "
+             "in game only (not in menus). Switching on from Off takes a game restart; the multipliers switch "
+             "right away.");
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (g_set.enabled && !g_ready && !g_initTried && !g_factoryHooked)
             ImGui::TextColored(kWarn, "Restart the game to start frame generation.");
-        if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
+        else if (g_set.enabled && g_set.tech != g_activeTech)
+            ImGui::TextColored(kWarn, "Restart the game to switch to %s frame generation.", g_set.tech == kTechFsr ? "FSR" : "DLSS");
+        if (!Fsr() && g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
             ImGui::TextColored(kWarn, "%s isn't supported here, so %s.", kModeNames[g_set.mode],
                                kModeNames[EffectiveMode(g_set.mode)]);
     }
+    if (g_set.tech == kTechFsr) return;  // the object separation is DLSS's
 
     float sep = g_set.separation;
     ImGui::SetNextItemWidth(ControlWidth());
@@ -1183,7 +1379,8 @@ std::string FrameGenHeadline(bool* warn) {
                                               : std::string("Frame generation: restart the game to start it");
     }
     if (!g_upgraded) return (*warn = true), "Frame generation not running: the game's swapchain wasn't handed over";
-    if (!g_fgOn) return "Frame generation paused (DLSS off, menu or loading)";
+    if (!g_fgOn) return "Frame generation paused (upscaler off, menu or loading)";
+    if (Fsr()) return fsrfg::Version() + " on: 2x";
     char buf[96];
     snprintf(buf, sizeof(buf), "Frame generation %s: %u frames per rendered frame",
              g_appliedMode >= 0 && g_appliedMode < kModeCount ? kModeNames[g_appliedMode] : "on",
@@ -1195,7 +1392,14 @@ void DrawFrameGenStatus() {
     ImGui::SeparatorText("Frame generation");
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready) {
-        ImGui::TextDisabled("Streamline: %s", g_status.c_str());
+        ImGui::TextDisabled("%s: %s", Fsr() ? "FSR" : "Streamline", g_status.c_str());
+        return;
+    }
+    if (Fsr()) {
+        ImGui::TextDisabled("%s: %s, %s", fsrfg::Version().c_str(), fsrfg::Status().c_str(), g_fgOn ? "2x" : "paused");
+        ImGui::TextDisabled("Game frames %llu: with depth and motion %llu, with the picture before the HUD %llu",
+                            static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
+                            static_cast<unsigned long long>(g_hudlessCount.load()));
         return;
     }
     const unsigned st = static_cast<unsigned>(g_state.status);

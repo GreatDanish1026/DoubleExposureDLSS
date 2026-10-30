@@ -81,6 +81,56 @@ what most FSR users will want next, and DLSS SR + FSR FG is a common combo on RT
 - Bigger and riskier than the upscaler (pacing, HUD handling, present hooks): do after FSR SR
   ships.
 
+**Status (1.2.0, 2026-10-30): built, untested in game.** `src/fsrfg.cpp` + framegen.cpp: Technology
+setting DLSS/FSR (ini `FrameGenTech` 0/1, read at launch), FSR mode Off/2x. FSR path: our factory
+hooks create FSR's swapchain (FOR_HWND / NEW), present hooks call configure + prepare before each
+Present (prepare in our own command list on the game queue, after the frame's lists), inputs taken
+at submission like Streamline's tags. Swapchain Release hooked: when the game's last reference
+goes (count probed with AddRef/Release vs FSR's own references counted at creation), the FG
+context (disabled first) and the swapchain context are destroyed. HDR is assumed when UE made the
+pre-HUD copy (UE's SDR back buffer is 10-bit too). Frame-gen context recreated on back buffer
+size/format/HDR change.
+
+### FSR frame generation design (from SDK 2.4.0 docs, 2026-10-30)
+
+Runtime: `amd_fidelityfx_framegeneration_dx12.dll` (29.7 MB) next to the exe, same loader. FSR FG
+3.1.7 (analytical) runs on any DX12 GPU; FSR FG 4.0.2 (ML) only on RX 9000 + Windows 11, picked by
+the runtime. One generated frame per rendered frame (2x).
+
+API, per AMD's required order each frame:
+1. Swapchain: in our CreateSwapChainForHwnd hook, `ffxCreateContext` with
+   `ffxCreateContextDescFrameGenerationSwapChainForHwndDX12` (hwnd, desc, fullscreen desc, the real
+   factory, the game's queue) returns FFX's proxy `IDXGISwapChain4`; the game gets that. Same place
+   Streamline's proxy is made today, so DLSS FG and FSR FG are a launch-time choice.
+2. A frame-generation context (`ffxCreateContextDescFrameGeneration`: display size, max render
+   size, back buffer format, flags HDR | DEPTH_INVERTED | DEPTH_INFINITE; plus
+   `ffxCreateContextDescFrameGenerationHudless` if the pre-HUD copy's format differs).
+3. Each frame: `ffxConfigure(ffxConfigureDescFrameGeneration)` with the proxy swapchain,
+   `frameGenerationCallback` = a function calling `ffxDispatch` on our context (AMD's recommended
+   path; the swapchain calls it at present), `HUDLessColor` = our pre-HUD copy (HDR only), frameID
+   +1 per frame, enabled flag.
+4. Each frame: `ffxDispatch(ffxDispatchDescFrameGenerationPrepareV2)` on a command list: depth,
+   our motion vectors (render px, scale 1), jitter, render size, frame time, reset, near / FOV /
+   0.01 m per unit, camera position / up / right / forward (already computed for DLSS-G from the
+   View buffer).
+
+Reuse: depth copy, motion vectors, camera matrices, pre-HUD copy, frame bookkeeping in OnExecute.
+To tie the prepare pass to the right frame (like Streamline's tags), it's recorded in our own
+command list and submitted on the game's queue right after the game's list that holds the inputs.
+
+Thread safety: AMD says prepare-dispatch, context create/destroy and the swapchain's present must
+not run at the same time: one mutex around them (the callback runs inside Present).
+
+Shutdown: Configure with frameGenerationEnabled = false (waits for presents), destroy the FG
+context, then the swapchain context.
+
+Not available on NVIDIA with FSR FG: Reflex (FFX paces itself; latency is higher than DLSS FG).
+SDR: no pre-HUD copy (UE draws the HUD into the back buffer), so the HUD may warp, as with DLSS FG.
+
+Risks to test: ReShade's own swapchain wrapping with FFX's proxy (worked for Streamline's), the
+present-time callback running on FFX's thread, HDR10 transfer function, resize/fullscreen
+switches, exit (shutdown order; DLSS FG had an exit abort that needed a recursive mutex).
+
 ## Work list (Double Exposure)
 
 1. Download FidelityFX SDK 2.4.0 into `third_party/fidelityfx` (headers in git, DLLs gitignored
