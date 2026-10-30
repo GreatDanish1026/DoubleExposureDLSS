@@ -37,6 +37,7 @@ struct Context {
     unsigned maxRenderW = 0, maxRenderH = 0, outW = 0, outH = 0;
     unsigned renderW = 0, renderH = 0;  // last dispatch's
     uint64_t lastFrame = 0;
+    LARGE_INTEGER lastEval = {};  // for the frame time
     float tuning[3] = {-99, -99, -99};  // last applied velocity factor, min disocclusion, shading change
     bool debug = false;  // created with FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION
 };
@@ -80,9 +81,21 @@ std::vector<Retired> g_retired;
 uint64_t g_frame = 0;
 constexpr uint64_t kRetireFrames = 8;
 
-// Frame time for FSR, measured between presents.
-LARGE_INTEGER g_freq = {}, g_lastPresent = {};
-float g_frameMs = 16.7f;
+// Frame time for FSR, measured between a view's evaluations (not presents: with frame generation
+// every rendered frame is presented twice or more).
+LARGE_INTEGER g_freq = {};
+
+float FrameMs(LARGE_INTEGER& last) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    float ms = 16.7f;
+    if (g_freq.QuadPart && last.QuadPart) {
+        const float d = static_cast<float>(now.QuadPart - last.QuadPart) * 1000.0f / g_freq.QuadPart;
+        if (d > 0.5f && d < 200) ms = d;
+    }
+    last = now;
+    return ms;
+}
 
 void Message(uint32_t type, const wchar_t* message) {
     static int count = 0;
@@ -270,7 +283,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
     d.upscaleSize = {in.outputWidth, in.outputHeight};
     d.enableSharpening = in.sharpness > 0.001f;
     d.sharpness = in.sharpness;
-    d.frameTimeDelta = g_frameMs;
+    d.frameTimeDelta = FrameMs(c.lastEval);
     d.preExposure = 1.0f;
     d.reset = in.reset || fresh;
     d.cameraNear = in.cameraNear;
@@ -295,13 +308,6 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
 void EndFrame() {
     std::lock_guard<std::mutex> lock(g_mutex);
     ++g_frame;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (g_freq.QuadPart && g_lastPresent.QuadPart) {
-        const float ms = static_cast<float>(now.QuadPart - g_lastPresent.QuadPart) * 1000.0f / g_freq.QuadPart;
-        g_frameMs = ms > 0.5f && ms < 200 ? ms : 16.7f;
-    }
-    g_lastPresent = now;
     for (size_t i = 0; i < g_retired.size();) {
         if (g_frame - g_retired[i].frame < kRetireFrames) {
             ++i;

@@ -71,7 +71,6 @@ const char* const kModeNames[kModeCount] = {"Off", "2x", "3x", "4x", "Dynamic"};
 // Each replaces the game's swapchain, so the one picked at launch is used until a restart.
 enum Tech : int { kTechDlss, kTechFsr, kTechCount };
 const char* const kTechNames[kTechCount] = {"DLSS (NVIDIA RTX 40/50)", "FSR (any graphics card)"};
-const char* const kFsrModeNames[2] = {"Off", "2x"};
 
 struct Settings {
     int tech = kTechDlss;  // ini FrameGenTech
@@ -1306,45 +1305,29 @@ void UnregisterFrameGen() {
 
 void DrawFrameGenSettings() {
     ImGui::SeparatorText("Frame generation");
+    // One list for both technologies (two dropdowns let the technology be missed): Off, DLSS 2x / 3x /
+    // 4x / Dynamic (FrameGenTech 0, FrameGenMode 1-4), FSR 2x (FrameGenTech 1, FrameGenMode 1).
+    static const char* const kChoices[] = {"Off", "DLSS 2x", "DLSS 3x", "DLSS 4x", "DLSS Dynamic", "FSR 2x"};
+    int choice = g_set.mode == kOff ? 0 : g_set.tech == kTechFsr ? 5 : g_set.mode;
     ImGui::BeginDisabled(!kTsrMapped);
-    int tech = g_set.tech;
     ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Technology##framegen", &tech, kTechNames, kTechCount)) {
-        g_set.tech = tech;
-        if (tech == kTechFsr && g_set.mode > k2x) g_set.mode = k2x, reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", g_set.mode);
-        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenTech", tech);
-        Log("settings: frame generation technology %s (from the next launch)", kTechNames[tech]);
-    }
-    Help("DLSS: NVIDIA's frame generation, RTX 40 and 50 series. Up to 4x, with NVIDIA Reflex for low latency.\n"
-         "FSR: AMD's frame generation, any DirectX 12 graphics card (FSR 4 on Radeon RX 9000 under Windows 11, "
-         "FSR 3.1 elsewhere). 2x, no Reflex (a little more latency).\n\nWorks with either upscaler. Takes effect "
-         "at the next game launch.");
-
-    int mode = g_set.mode;
-    bool picked = false;
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (g_set.tech == kTechFsr) {
-        int fsrMode = mode == kOff ? 0 : 1;
-        picked = ImGui::Combo("Mode##framegen", &fsrMode, kFsrModeNames, 2);
-        mode = fsrMode ? k2x : kOff;
-    } else {
-        picked = ImGui::Combo("Mode##framegen", &mode, kModeNames, kModeCount);
-    }
+    const bool picked = ImGui::Combo("Frame generation##framegen", &choice, kChoices, 6);
     ImGui::EndDisabled();
     if (picked) {
-        g_set.mode = mode;
-        g_set.enabled = mode != kOff;
-        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", mode);
-        Log("settings: frame generation %s", kModeNames[mode]);
+        if (choice == 5) g_set.tech = kTechFsr, g_set.mode = k2x;
+        else if (choice > 0) g_set.tech = kTechDlss, g_set.mode = choice;
+        else g_set.mode = kOff;
+        g_set.enabled = g_set.mode != kOff;
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", g_set.mode);
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenTech", g_set.tech);
+        Log("settings: frame generation %s", kChoices[choice]);
     }
-    if (g_set.tech == kTechFsr)
-        Help("AMD FSR Frame Generation: 2x adds one generated frame per rendered frame.\n\nNeeds the upscaler on, "
-             "and runs in game only (not in menus). Switching on from Off takes a game restart.");
-    else
-        Help("NVIDIA DLSS Frame Generation: 2x, 3x and 4x add 1, 2 or 3 generated frames per rendered frame. "
-             "Dynamic picks the multiplier to reach the display's refresh rate.\n\nNeeds the upscaler on, and runs "
-             "in game only (not in menus). Switching on from Off takes a game restart; the multipliers switch "
-             "right away.");
+    Help("DLSS: NVIDIA's frame generation, RTX 40 and 50 series. 2x, 3x and 4x add 1, 2 or 3 generated frames per "
+         "rendered frame (3x and 4x need an RTX 50); Dynamic picks the multiplier to reach the display's refresh "
+         "rate. Uses NVIDIA Reflex for low latency.\n\nFSR: AMD's frame generation, any DirectX 12 graphics card "
+         "(FSR 4 on Radeon RX 9000 under Windows 11, FSR 3.1 elsewhere). 2x; no Reflex, so a little more "
+         "latency.\n\nWorks with either upscaler, needs the upscaler on, and runs in game only (not in menus). "
+         "Switching it on, or between DLSS and FSR, takes a game restart; DLSS's multipliers switch right away.");
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
