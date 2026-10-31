@@ -37,6 +37,7 @@ $cmd = @(
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kTintCs /Fh `"$obj\tint_cs.h`" `"$root\src\tint.hlsl`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kComposeCs /Fh `"$obj\compose_cs.h`" `"$root\src\compose.hlsl`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kUiAlphaCs /Fh `"$obj\ui_alpha_cs.h`" `"$root\src\ui_alpha.hlsl`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kHudComposeCs /Fh `"$obj\hud_compose_cs.h`" `"$root\src\hud_compose.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
      "/I `"$obj`" /I `"$root\third_party\imgui`" /I`"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" /I `"$root\third_party\streamline\include`" " +
      "/I `"$root\third_party\fidelityfx\api\include`" /I `"$root\third_party\fidelityfx\upscalers\include`" /I `"$root\third_party\fidelityfx\framegeneration\include`" " +

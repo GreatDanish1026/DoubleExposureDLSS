@@ -40,8 +40,11 @@ ULONG OwnReferences();
 // generation for this frame and records + submits the prepare pass on the game's queue.
 // <in> null: this frame has no inputs (frame generation then pauses after a few such frames).
 // <hudless>: the picture before the HUD (back buffer format, shader resource), or null.
-void BeforePresent(bool enable, const FrameInputs* in, ID3D12Resource* hudless, unsigned bbWidth, unsigned bbHeight,
-                   DXGI_FORMAT bbFormat, bool hdr);
+// <uiMask>: this frame's HUD opacity (r8, back buffer size, shader resource), or null.
+// <hudMode>: what FSR gets to tell the HUD apart (HudMode).
+enum HudMode : int { kHudComposite, kHudPreHud, kHudOff, kHudModeCount };
+void BeforePresent(bool enable, const FrameInputs* in, ID3D12Resource* hudless, ID3D12Resource* uiMask, int hudMode,
+                   unsigned bbWidth, unsigned bbHeight, DXGI_FORMAT bbFormat, bool hdr);
 
 // The game is releasing its last reference to the swapchain: frame generation and FSR's swapchain
 // context are shut down first, as AMD requires.

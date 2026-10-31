@@ -1,4 +1,4 @@
-# DoubleExposureDLSS 1.2.0
+# DoubleExposureDLSS 1.2.1
 
 ReShade add-on for **Life is Strange: Double Exposure** (Unreal Engine 5.2, DirectX 12) that
 replaces the game's TSR upscaler with **NVIDIA DLSS** or **AMD FSR**, and adds **DLSS Frame

@@ -28,6 +28,10 @@ uint32_t PipeId(reshade::api::pipeline pipe);
 // TSR's compute shaders in this game build 16505703 (UE 5.2.1; capture 2026-10-26,
 // docs/FINDINGS.md), in the order they run, all in one command list on the graphics queue.
 constexpr bool kTsrMapped = true;
+// Frame generation's inputs go to their frame when the game submits them (false; UE 5.2 submits
+// and presents on the same thread) or when they're recorded (true, ReunionDLSS: UE 5.6 submits on
+// a thread of its own). framegen.cpp is shared with ReunionDLSS.
+constexpr bool kTagAtRecord = false;
 constexpr uint32_t kTsrClearPrevTextures = 0x42e09aac;
 constexpr uint32_t kTsrForwardScatterDepth = 0x02016352;
 constexpr uint32_t kTsrDilateVelocity = 0xcf6ec20a;     // t0 depth, t1 velocity -> u0 dilated velocity

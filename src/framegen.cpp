@@ -56,9 +56,9 @@ namespace {
 constexpr const char* kProjectId = "6f1d6e2a-5b8c-4f2e-9a43-7c2b8e1d4a90";
 
 // Byte offsets in UE 5.2's View uniform buffer (FViewUniformShaderParameters), read from a capture
-// (docs/FINDINGS.md): 5.2 has one more matrix after TranslatedWorldToClip than 5.6 (Reunion: 64,
-// 256, 448, 512), so the rest sit 64 bytes later. Checked against the buffer at run time
-// (CheckCamera).
+// (docs/FINDINGS.md): 5.2 has one more matrix after TranslatedWorldToClip than 5.6, so the rest sit
+// 64 bytes later than in ReunionDLSS (which shares this file). Checked against the buffer at run
+// time (CheckCamera).
 constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 128, kViewToTranslatedWorld = 320,
                    kViewToClip = 512, kViewToClipNoAA = 576;
 
@@ -80,7 +80,10 @@ struct Settings {
     // must be for DLSS-G to treat them as separate objects, in units of 1 / device depth. UE's
     // near plane is 10 cm, so NVIDIA's default 40 is 4 m.
     float separation = 40;
+    // FSR: what it compares the back buffer with to find the HUD (fsrfg::HudMode); ini FsrHudMode.
+    int fsrHud = 0;
 } g_set;
+const char* const kFsrHudNames[] = {"Composite (recommended)", "Picture before the HUD", "Off"};
 
 uint32_t g_maxFrames = 1;  // DLSSGState::numFramesToGenerateMax
 bool g_dynamicSupported = false, g_capsKnown = false;
@@ -126,6 +129,7 @@ struct Tagged {
     void Set(uint32_t frame) { previous = last, last = frame; }
 };
 Tagged g_inputs, g_hudless;  // depth + motion + constants; the picture before the HUD
+Tagged g_hudMask;            // FSR: frames whose HUD mask was recorded
 
 // Inputs are prepared while the game records a frame's command list and handed to Streamline when
 // that list is submitted (execute_command_list). Lists are submitted in the order frames are
@@ -145,12 +149,36 @@ struct PendingHud {
 };
 std::map<uint64_t, PendingInputs> g_pendingInputs;  // by native command list
 std::map<uint64_t, PendingHud> g_pendingHud;
-// FSR: the inputs submitted for frame g_fsrInputsFrame, handed to FSR right before its Present.
-PendingInputs g_fsrInputs;
-uint32_t g_fsrInputsFrame = UINT32_MAX;
+// FSR: inputs by the frame they belong to, handed to FSR right before that frame's Present.
+std::map<uint32_t, PendingInputs> g_fsrByFrame;
 
 // Frames are being counted: Streamline's frame token exists, or FSR's swapchain runs.
 bool Frames() { return Fsr() ? g_ready && g_upgraded : g_token != nullptr; }
+
+// Which frame inputs belong to, decided when they're recorded (kTagAtRecord, UE 5.6): this frame,
+// or the next one if this one has them already (UE 5.6 records the next frame while this one is
+// presenting; it also submits on a separate thread, so the submission order can't tell). UINT32_MAX
+// if both have them.
+uint32_t TargetFrame(const Tagged& t) {
+    if (!t.Has(g_frame)) return g_frame;
+    if (!t.Has(g_frame + 1)) return g_frame + 1;
+    return UINT32_MAX;
+}
+
+// Streamline's token for <frame> (this frame's, or the next one's).
+sl::FrameToken* TokenFor(uint32_t frame) {
+    if (frame == g_frame) return g_token;
+    sl::FrameToken* t = nullptr;
+    return g_sl.getNewFrameToken(t, &frame) == sl::Result::eOk ? t : nullptr;
+}
+
+// The order of inputs and presents for the first frames with inputs, in the log (diagnosis).
+int g_traceLines = 0;
+void Trace(const char* what, uint32_t frame) {
+    if (g_traceLines >= 120) return;
+    if (++g_traceLines == 120) Log("trace: (last trace line)");
+    Log("trace: %s, frame %u (presenting frame %u, thread %lu)", what, frame, g_frame, GetCurrentThreadId());
+}
 // Our copies of UE's depth (two, alternating), the depth's size and format.
 ID3D12Resource* g_depthCopy[2] = {};
 int g_depthNext = 0;
@@ -349,12 +377,17 @@ void CheckUiRow();
 // prepare (fsrfg.cpp).
 void BeforePresentFsr() {
     ++g_presents;
-    const bool has = g_inputs.Has(g_frame) && g_fsrInputsFrame == g_frame;
+    while (!g_fsrByFrame.empty() && static_cast<int32_t>(g_fsrByFrame.begin()->first - g_frame) < 0)
+        g_fsrByFrame.erase(g_fsrByFrame.begin());  // frames already presented
+    auto found = g_fsrByFrame.find(g_frame);
+    const bool has = g_inputs.Has(g_frame) && found != g_fsrByFrame.end();
+    if (g_tagged) Trace(has ? "present with inputs" : "present WITHOUT inputs", g_frame);
     g_untagged = has ? 0 : g_untagged + 1;
     if (g_untagged) ++g_framesUntagged;
     fsrfg::FrameInputs in;
     if (has) {
-        const PendingInputs& p = g_fsrInputs;
+        const PendingInputs p = found->second;
+        g_fsrByFrame.erase(found);
         const sl::Constants& c = p.constants;
         in.depth = p.depth, in.motion = p.motion, in.renderWidth = p.rw, in.renderHeight = p.rh;
         in.jitterX = c.jitterOffset.x, in.jitterY = c.jitterOffset.y;
@@ -367,10 +400,12 @@ void BeforePresentFsr() {
     }
     const bool want = g_set.enabled && g_tagged > 0 && g_untagged < 8;
     ID3D12Resource* hud = g_hudless.Has(g_frame) && g_hudlessTex.handle ? reinterpret_cast<ID3D12Resource*>(g_hudlessTex.handle) : nullptr;
+    ID3D12Resource* mask = hud && g_hudMask.Has(g_frame) && g_mask.tex.handle ? reinterpret_cast<ID3D12Resource*>(g_mask.tex.handle) : nullptr;
+    CheckUiRow();  // the HUD layer's alpha check (inverted or not), for the mask
     // UE only makes the picture before the HUD with HDR output: that's how HDR is told apart (UE's
     // SDR back buffer is 10-bit too).
-    fsrfg::BeforePresent(want, has ? &in : nullptr, hud, g_bbWidth, g_bbHeight, static_cast<DXGI_FORMAT>(g_bbFormat),
-                         g_hudlessCount > 0);
+    fsrfg::BeforePresent(want, has ? &in : nullptr, hud, mask, g_set.fsrHud, g_bbWidth, g_bbHeight,
+                         static_cast<DXGI_FORMAT>(g_bbFormat), g_hudlessCount > 0);
     const bool running = fsrfg::Running();
     if (running != g_fgOn) g_appliedMode = running ? k2x : kOff;
     g_fgOn = running;
@@ -384,6 +419,7 @@ void BeforePresent() {
     Marker(sl::PCLMarker::eRenderSubmitEnd);
     // A frame now and then misses its inputs (another view, a hitch): frame generation only
     // pauses after several in a row (menus, loading, DLSS off), since each switch can stutter.
+    if (g_tagged) Trace(g_inputs.Has(g_frame) ? "present with inputs" : "present WITHOUT inputs", g_frame);
     g_untagged = g_inputs.Has(g_frame) ? 0 : g_untagged + 1;
     if (g_untagged) ++g_framesUntagged;
     SetFrameGeneration(g_set.enabled && g_tagged > 0 && g_untagged < 8);
@@ -1015,6 +1051,80 @@ bool RecordMask(command_list* cl, resource ui) {
 // buffer and then blends the HUD over that copy. The copy's source is the picture before the
 // HUD: it's copied into our own texture and handed to frame generation, so the HUD isn't warped
 // with the scene. (Without that copy, as in SDR, frame generation runs without it.)
+// Hands one frame's depth, motion vectors and camera to frame <frame>: kept for FSR (taken right
+// before that frame's Present), or tagged for Streamline. <list>: the command list they were
+// recorded in (when handed over at recording), or null (at submission).
+void GiveInputs(uint32_t frame, const PendingInputs& p, ID3D12GraphicsCommandList* list) {
+    Trace(list ? "inputs recorded" : "inputs submitted", frame);
+    // Two sets for one frame (a hitch, another view): Streamline refuses different constants for
+    // the same frame, so the first one stays.
+    if (frame == UINT32_MAX || g_inputs.Has(frame)) return void(++g_tagWhy["second set in a frame, skipped"]);
+    if (Fsr()) {
+        g_fsrByFrame[frame] = p;
+        while (g_fsrByFrame.size() > 4) g_fsrByFrame.erase(g_fsrByFrame.begin());
+        g_inputs.Set(frame);
+        ++g_tagsSet;
+        if (++g_tagged == 1) Log("frame generation: first frame's inputs (%ux%u)", p.rw, p.rh);
+        return;
+    }
+    sl::FrameToken* token = TokenFor(frame);
+    if (!token) return void(++g_tagWhy["no frame token"]);
+    sl::Result r = g_sl.setConstants(p.constants, *token, sl::ViewportHandle(0));
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
+        return;
+    }
+    sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
+    sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent extent{0, 0, p.rw, p.rh};
+    // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
+    const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
+    const sl::ResourceTag tags[3] = {
+        sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+        sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+        sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
+    r = g_sl.setTagForFrame(*token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, list);
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
+        return;
+    }
+    g_inputs.Set(frame);
+    ++g_tagsSet;
+    if (++g_tagged == 1) Log("frame generation: first frame tagged %s (%ux%u)", list ? "at recording" : "at submission", p.rw, p.rh);
+}
+
+// Hands the picture before the HUD (and the HUD mask if <mask>) to frame <frame>.
+void GiveHud(uint32_t frame, bool mask, ID3D12GraphicsCommandList* list) {
+    if (frame == UINT32_MAX || !g_hudlessTex.handle) return;
+    mask = mask && g_mask.tex.handle;
+    if (Fsr()) {
+        g_hudless.Set(frame), ++g_hudlessCount;
+        if (mask) g_hudMask.Set(frame), ++g_uiCount;
+        return;
+    }
+    sl::FrameToken* token = TokenFor(frame);
+    if (!token) return;
+    const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
+    sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
+                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::ResourceTag tags[2] = {
+        sl::ResourceTag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+        sl::ResourceTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
+    const uint32_t n = mask ? 2 : 1;
+    if (g_sl.setTagForFrame(*token, sl::ViewportHandle(0), tags, n, list) == sl::Result::eOk) {
+        g_hudless.Set(frame);
+        ++g_hudlessCount;
+        if (n == 2) ++g_uiCount;
+    } else {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed");
+    }
+}
+
 bool OnCopyResource(command_list* cl, resource src, resource dst) {
     if (!g_ready || !g_set.enabled || !g_bbWidth) return false;
     device* dev = cl->get_device();
@@ -1042,14 +1152,17 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     cl->barrier(g_hudlessTex, resource_usage::shader_resource, resource_usage::copy_dest);
     cl->copy_resource(src, g_hudlessTex);
     cl->barrier(g_hudlessTex, resource_usage::copy_dest, resource_usage::shader_resource);
-    PendingHud& pending = g_pendingHud[cl->get_native()];  // tagged when the list is submitted
-    pending.mask = false;
+    bool mask = false;
     FgList* l = cl->get_private_data<FgList>();
     const resource ui = l ? l->uiLayer : resource{0};
     if (ui.handle) {
         if (g_uiCheck == UiCheck::pending && g_presents > 120) ReadUiRow(cl, ui);  // past the first frames
-        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) pending.mask = true;
+        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) mask = true;
     }
+    if (kTagAtRecord)
+        GiveHud(TargetFrame(g_hudless), mask, reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
+    else
+        g_pendingHud[cl->get_native()].mask = mask;  // handed over when the list is submitted
     return false;  // the game's copy goes ahead
 }
 
@@ -1161,9 +1274,11 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
     list->ResourceBarrier(2, before);
     list->CopyResource(copy, depth);
     list->ResourceBarrier(2, after);
-    PendingInputs& pending = g_pendingInputs[reinterpret_cast<uint64_t>(list)];  // tagged when the list is submitted
-    pending.constants = c;
-    pending.depth = copy, pending.motion = motion, pending.rw = rw, pending.rh = rh;
+    PendingInputs inputs;
+    inputs.constants = c;
+    inputs.depth = copy, inputs.motion = motion, inputs.rw = rw, inputs.rh = rh;
+    if (kTagAtRecord) GiveInputs(TargetFrame(g_inputs), inputs, list);
+    else g_pendingInputs[reinterpret_cast<uint64_t>(list)] = inputs;  // handed over when the list is submitted
 }
 
 namespace {
@@ -1181,81 +1296,15 @@ void OnExecute(command_queue*, command_list* cl) {
         if (hud != g_pendingHud.end()) g_pendingHud.erase(hud);
         return;
     }
-    if (Fsr()) {  // kept for FSR, which gets them right before this frame's Present
-        if (in != g_pendingInputs.end()) {
-            if (g_inputs.Has(g_frame)) {
-                ++g_tagWhy["second set in a frame, skipped"];
-            } else {
-                g_fsrInputs = in->second;
-                g_fsrInputsFrame = g_frame;
-                g_inputs.Set(g_frame);
-                ++g_tagsSet;
-                if (++g_tagged == 1) Log("frame generation: first frame's inputs submitted (%ux%u)", in->second.rw, in->second.rh);
-            }
-            g_pendingInputs.erase(in);
-        }
-        if (hud != g_pendingHud.end()) {
-            g_pendingHud.erase(hud);
-            if (g_hudlessTex.handle) g_hudless.Set(g_frame), ++g_hudlessCount;
-        }
-        return;
-    }
     if (in != g_pendingInputs.end()) {
         const PendingInputs p = in->second;
         g_pendingInputs.erase(in);
-        // Two frames' lists before one Present (a hitch): Streamline takes one set per frame and
-        // refuses different constants for the same frame, so the first one stays.
-        if (g_inputs.Has(g_frame)) {
-            ++g_tagWhy["second set in a frame, skipped"];
-        } else {
-            sl::Result r = g_sl.setConstants(p.constants, *g_token, sl::ViewportHandle(0));
-            if (r != sl::Result::eOk) {
-                static int logged = 0;
-                if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
-            } else {
-                sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
-                sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr,
-                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                const sl::Extent extent{0, 0, p.rw, p.rh};
-                // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
-                const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
-                const sl::ResourceTag tags[3] = {
-                    sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                    sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                    sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
-                r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, nullptr);
-                if (r != sl::Result::eOk) {
-                    static int logged = 0;
-                    if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
-                } else {
-                    g_inputs.Set(g_frame);
-                    ++g_tagsSet;
-                    if (++g_tagged == 1) Log("frame generation: first frame tagged at submission (%ux%u)", p.rw, p.rh);
-                }
-            }
-        }
+        GiveInputs(g_frame, p, nullptr);
     }
     if (hud != g_pendingHud.end()) {
-        const PendingHud h = hud->second;
+        const bool mask = hud->second.mask;
         g_pendingHud.erase(hud);
-        const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
-        sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
-                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
-                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        const sl::ResourceTag tags[2] = {
-            sl::ResourceTag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-            sl::ResourceTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
-        const uint32_t n = h.mask && g_mask.tex.handle ? 2 : 1;
-        if (g_hudlessTex.handle &&
-            g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, n, nullptr) == sl::Result::eOk) {
-            g_hudless.Set(g_frame);
-            ++g_hudlessCount;
-            if (n == 2) ++g_uiCount;
-        } else {
-            static int logged = 0;
-            if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed");
-        }
+        GiveHud(g_frame, mask, nullptr);
     }
 }
 
@@ -1272,6 +1321,8 @@ void RegisterFrameGen() {
     if (!(g_set.separation >= 1 && g_set.separation <= 100)) g_set.separation = 40;
     reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGenTech", g_set.tech);
     if (g_set.tech < 0 || g_set.tech >= kTechCount) g_set.tech = kTechDlss;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrHudMode", g_set.fsrHud);
+    if (g_set.fsrHud < 0 || g_set.fsrHud >= fsrfg::kHudModeCount) g_set.fsrHud = fsrfg::kHudComposite;
     g_activeTech = g_set.tech;  // until the next launch
     g_set.enabled = g_set.mode != kOff && kTsrMapped;  // needs the upscaler, which needs TSR mapped
     if (g_set.enabled) Log("frame generation: %s, %s", kTechNames[g_activeTech], kModeNames[EffectiveMode(g_set.mode)]);
@@ -1339,7 +1390,19 @@ void DrawFrameGenSettings() {
             ImGui::TextColored(kWarn, "%s isn't supported here, so %s.", kModeNames[g_set.mode],
                                kModeNames[EffectiveMode(g_set.mode)]);
     }
-    if (g_set.tech == kTechFsr) return;  // the object separation is DLSS's
+    if (g_set.tech == kTechFsr) {  // the object separation is DLSS's; the HUD protection FSR's
+        ImGui::SetNextItemWidth(ControlWidth());
+        if (ImGui::Combo("HUD protection", &g_set.fsrHud, kFsrHudNames, fsrfg::kHudModeCount)) {
+            reshade::set_config_value(nullptr, RD_PRODUCT, "FsrHudMode", g_set.fsrHud);
+            Log("settings: FSR HUD protection %s", kFsrHudNames[g_set.fsrHud]);
+        }
+        Help("How FSR keeps the HUD and subtitles from warping (HDR only: in SDR the game draws its HUD straight "
+             "onto the screen).\n\nComposite: FSR compares the screen with a copy that differs only where the "
+             "game's HUD layer has something. Recommended.\nPicture before the HUD: the game's own copy from "
+             "before the HUD; in this game it also differs around characters, which then jitter.\nOff: the HUD "
+             "is generated like the rest of the picture and may wobble.\n\nSwitches right away.");
+        return;
+    }
 
     float sep = g_set.separation;
     ImGui::SetNextItemWidth(ControlWidth());
